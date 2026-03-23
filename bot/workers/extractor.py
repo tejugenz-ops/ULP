@@ -170,16 +170,37 @@ def _extract_credential(line: str) -> str | None:
     """
     Extract login:password from a ULP/logs line.
 
-    ULP format: URL:login:password  (or just login:password)
-    We take the last two colon-separated segments.
-    Returns 'login:password' or None if not enough parts.
+    Handles common formats:
+      https://example.com:login:password   → login:password
+      //example.com login:password         → login:password  (space-separated URL)
+      http://example.com/path login:pass   → login:pass
+      login:password                       → login:password
     """
-    parts = line.split(":")
+    text = line.strip()
+    if not text:
+        return None
+
+    # If there's a space, the part after the last space might be login:pass
+    # (handles "//url login:pass" and "https://url/path login:pass")
+    if " " in text:
+        after_space = text.rsplit(" ", 1)[-1]
+        if ":" in after_space:
+            parts = after_space.split(":")
+            login = parts[-2].strip()
+            password = parts[-1].strip()
+            if login and password:
+                return f"{login}:{password}"
+
+    # Standard colon-split: take last two segments
+    parts = text.split(":")
     if len(parts) < 2:
         return None
     login = parts[-2].strip()
     password = parts[-1].strip()
     if not login or not password:
+        return None
+    # Skip if "login" looks like a URL fragment (contains / or //)
+    if "/" in login:
         return None
     return f"{login}:{password}"
 
