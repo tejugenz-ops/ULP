@@ -8,7 +8,7 @@ from pathlib import Path
 
 from bot.config import PROCESSING_DIR
 from bot.db import crud
-from bot.db.models import JobStatus
+from bot.db.models import FileStatus, JobStatus
 
 log = logging.getLogger(__name__)
 
@@ -173,14 +173,28 @@ async def extract_keywords_batch(
 
     await crud.update_job(job_id, status=JobStatus.RUNNING, progress=0)
 
+    current_status_message_id = status_message_id
+    last_progress_text = ""
+
     async def _set_progress(text: str) -> None:
-        if status_message_id:
+        nonlocal current_status_message_id, last_progress_text
+
+        if text == last_progress_text:
+            return
+
+        if current_status_message_id:
             try:
-                await tg.edit_message_text(chat_id, status_message_id, text)
+                await tg.edit_message_text(chat_id, current_status_message_id, text)
+                last_progress_text = text
                 return
-            except Exception:
-                pass
-        await tg.send_message(chat_id, text)
+            except Exception as e:
+                # Don't spam fallback messages for no-op edit errors.
+                if "MESSAGE_NOT_MODIFIED" in str(e):
+                    return
+
+        sent = await tg.send_message(chat_id, text)
+        current_status_message_id = sent.id
+        last_progress_text = text
 
     try:
         if not file_ids or not keywords:
@@ -193,9 +207,10 @@ async def extract_keywords_batch(
             return
 
         await _set_progress(
-            f"🔎 {mode.upper()} scan started\n"
+            f"🚀 {mode.upper()} pipeline started\n"
             f"Files: {len(file_ids)} | Keywords: {len(keywords)}\n"
-            "Progress: 0%"
+            "Phase: Preparing\n"
+            "Overall Progress: 0%"
         )
 
         # Normalize keywords while preserving original text for filenames/captions.
@@ -210,22 +225,43 @@ async def extract_keywords_batch(
 
         keyword_hits: dict[str, list[str]] = {kw: [] for kw in deduped_keywords}
 
+        # Phase 1: wait for all files to finish downloading first.
+        total_files = len(file_ids)
+        wait_cycles = 0
+        while True:
+            wait_cycles += 1
+            ready_count = 0
+            error_count = 0
+            for fid in file_ids:
+                fr = await crud.get_file(fid)
+                if not fr:
+                    continue
+                if fr.status == FileStatus.READY and fr.local_path:
+                    ready_count += 1
+                elif fr.status == FileStatus.ERROR:
+                    error_count += 1
+
+            if ready_count >= total_files:
+                break
+
+            download_progress = int((ready_count / max(1, total_files)) * 35)
+            await _set_progress(
+                f"⏳ {mode.upper()} pipeline\n"
+                "Phase: Downloading files\n"
+                f"Overall Progress: {download_progress}%\n"
+                f"Ready files: {ready_count}/{total_files}\n"
+                f"Failed files: {error_count}"
+            )
+            await asyncio.sleep(2)
+
+            # Safety stop (about 20 minutes)
+            if wait_cycles > 600:
+                break
+
         for file_idx, file_id in enumerate(file_ids, start=1):
             file_record = await crud.get_file(file_id)
             if not file_record:
                 continue
-
-            # Wait for downloader job to finish and file path to become available.
-            wait_attempts = 0
-            while file_record and (not file_record.local_path) and wait_attempts < 120:
-                wait_attempts += 1
-                await asyncio.sleep(2)
-                file_record = await crud.get_file(file_id)
-                await _set_progress(
-                    f"⏳ Waiting for file downloads\n"
-                    f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
-                    f"File {file_idx}/{len(file_ids)} not ready yet..."
-                )
 
             if not file_record:
                 continue
@@ -246,10 +282,12 @@ async def extract_keywords_batch(
 
             await _set_progress(
                 f"🔎 {mode.upper()} searching\n"
-                f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
+                "Phase: Searching keywords\n"
+                f"Overall Progress: {35 + int((file_idx - 1) / max(1, len(file_ids)) * 55)}%\n"
                 f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})"
             )
 
+            file_hits = 0
             with filepath.open("r", encoding="utf-8", errors="replace") as fh:
                 for line_num, line in enumerate(fh, start=1):
                     text = line.rstrip("\n")
@@ -259,22 +297,29 @@ async def extract_keywords_batch(
                             keyword_hits[kw].append(
                                 f"{file_record.original_name}:{line_num}: {text}"
                             )
+                            file_hits += 1
 
                     # Show liveness progress even for one huge file.
                     if line_num % 100000 == 0:
+                        total_hits_so_far = sum(len(v) for v in keyword_hits.values())
                         await _set_progress(
                             f"🔎 {mode.upper()} searching\n"
-                            f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
+                            "Phase: Searching keywords\n"
+                            f"Overall Progress: {35 + int((file_idx - 1) / max(1, len(file_ids)) * 55)}%\n"
                             f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})\n"
-                            f"Lines scanned in current file: {line_num:,}"
+                            f"Lines scanned in current file: {line_num:,}\n"
+                            f"Hits found so far: {total_hits_so_far:,}"
                         )
 
-            progress = int((file_idx / max(1, len(file_ids))) * 80)
+            progress = 35 + int((file_idx / max(1, len(file_ids))) * 55)
             await crud.update_job(job_id, progress=progress)
+            total_hits_so_far = sum(len(v) for v in keyword_hits.values())
             await _set_progress(
                 f"🔎 {mode.upper()} scanning files\n"
-                f"Progress: {progress}%\n"
-                f"Processed files: {file_idx}/{len(file_ids)}"
+                "Phase: Searching keywords\n"
+                f"Overall Progress: {progress}%\n"
+                f"Processed files: {file_idx}/{len(file_ids)}\n"
+                f"Hits found so far: {total_hits_so_far:,}"
             )
 
         out_dir = PROCESSING_DIR / str(user_id) / "keyword_results"
@@ -299,11 +344,12 @@ async def extract_keywords_batch(
                 caption=f"📄 `{kw}` — {len(lines)} match(es)",
             )
 
-            keyword_progress = 80 + int((idx / len(deduped_keywords)) * 20)
+            keyword_progress = 90 + int((idx / len(deduped_keywords)) * 10)
             await crud.update_job(job_id, progress=keyword_progress)
             await _set_progress(
                 f"📤 Preparing result files\n"
-                f"Progress: {keyword_progress}%\n"
+                "Phase: Sending result files\n"
+                f"Overall Progress: {keyword_progress}%\n"
                 f"Generated: {idx}/{len(deduped_keywords)} keyword files"
             )
 
@@ -313,16 +359,26 @@ async def extract_keywords_batch(
             progress=100,
             result=f"keywords={len(deduped_keywords)}, files={len(file_ids)}, hits={total_hits}",
         )
+
+        counts_lines = [
+            f"• {kw}: {len(keyword_hits.get(kw, []))}"
+            for kw in deduped_keywords
+        ]
+        await tg.send_message(
+            chat_id,
+            "📊 Lines found per keyword:\n" + "\n".join(counts_lines),
+        )
+
         await tg.send_message(
             chat_id,
             f"✅ Done. Scanned {len(file_ids)} file(s), {len(deduped_keywords)} keyword(s), {total_hits} total hit(s).",
         )
-        if status_message_id:
-            await _set_progress(
-                f"✅ Completed\n"
-                f"Progress: 100%\n"
-                f"Files: {len(file_ids)} | Keywords: {len(deduped_keywords)} | Hits: {total_hits}"
-            )
+        await _set_progress(
+            f"✅ Completed\n"
+            "Phase: Done\n"
+            f"Overall Progress: 100%\n"
+            f"Files: {len(file_ids)} | Keywords: {len(deduped_keywords)} | Hits: {total_hits}"
+        )
 
     except Exception as e:
         log.exception("extract_keywords_batch failed: %s", e)
