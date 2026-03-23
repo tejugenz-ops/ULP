@@ -124,7 +124,8 @@ class Job(Base):
 
 # --- Engine & session factory ---
 
-engine = create_async_engine(DATABASE_URL, pool_size=20, max_overflow=10)
+_db_url = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+engine = create_async_engine(_db_url, pool_size=20, max_overflow=10)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 
