@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 from bot.config import PROCESSING_DIR
@@ -75,22 +76,21 @@ async def search_file(
         )
 
         # Run ripgrep — JSON output, max results cap, case-insensitive
-        proc = await asyncio.create_subprocess_exec(
-            "rg",
-            "--json",
-            "--max-count", str(MAX_RESULTS),
-            "-i",  # case insensitive
-            "--no-messages",  # suppress file permission errors
-            pattern,
-            str(filepath),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "rg", "--json",
+                "--max-count", str(MAX_RESULTS),
+                "-i",
+                "--no-messages",
+                pattern,
+                str(filepath),
+            ],
+            capture_output=True,
         )
 
-        stdout, stderr = await proc.communicate()
-
         matches: list[str] = []
-        for line in stdout.decode(errors="replace").splitlines():
+        for line in result.stdout.decode(errors="replace").splitlines():
             try:
                 obj = json.loads(line)
                 if obj.get("type") == "match":
@@ -340,22 +340,21 @@ async def extract_keywords_batch(
                 )
 
                 # Run ripgrep: case-insensitive, patterns from file, no heading
-                proc = await asyncio.create_subprocess_exec(
-                    "rg",
-                    "-i",                # case insensitive
-                    "--no-heading",      # no filename header
-                    "--no-line-number",  # we only need the matched text
-                    "--no-messages",     # suppress file permission errors
-                    "-f", str(kw_tmp),   # patterns file
-                    str(filepath),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                rg_result = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "rg", "-i",
+                        "--no-heading",
+                        "--no-line-number",
+                        "--no-messages",
+                        "-f", str(kw_tmp),
+                        str(filepath),
+                    ],
+                    capture_output=True,
                 )
 
-                stdout, _ = await proc.communicate()
-
                 # Categorize each matched line into keywords and extract credentials
-                for raw_line in stdout.decode(errors="replace").splitlines():
+                for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
                     stripped = raw_line.strip()
                     if not stripped:
                         continue
