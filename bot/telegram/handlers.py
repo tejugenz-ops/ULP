@@ -1,5 +1,6 @@
 """Telegram bot command and message handlers."""
 
+import logging
 import secrets
 import uuid
 from pathlib import Path
@@ -13,6 +14,8 @@ from bot.db import crud
 from bot.db.models import FileStatus, JobStatus, JobType
 from bot.telegram.bot import app
 from bot.telegram.progress import ProgressTracker
+
+log = logging.getLogger(__name__)
 
 # ── In-memory upload token store (token → user_id) ──
 # In production this would live in Redis; kept simple here.
@@ -32,26 +35,30 @@ def _authorized(user_id: int) -> bool:
 
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(_, message: Message):
+    log.info("Received /start from user %s", message.from_user.id)
     if not _authorized(message.from_user.id):
         return await message.reply("⛔ You are not authorized.")
-    await crud.get_or_create_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-    )
-    await message.reply(
-        "👋 **File Processing Bot**\n\n"
-        "Send me any file (up to 4 GB via Telegram) and I'll process it.\n\n"
-        "**Commands:**\n"
-        "/upload — Get a web upload link (no size limit)\n"
-        "/download `<url>` — Download file from URL\n"
-        "/files — List your stored files\n"
-        "/search `<file_id>` `<pattern>` — Search text in a file\n"
-        "/unzip `<file_id>` `[password]` — Extract an archive\n"
-        "/delete `<file_id>` — Delete a file\n"
-        "/status — Show active jobs\n"
-        "/cancel `<job_id>` — Cancel a job\n"
-    )
+    try:
+        await message.reply(
+            "👋 **File Processing Bot**\n\n"
+            "Send me any file (up to 4 GB via Telegram) and I'll process it.\n\n"
+            "**Commands:**\n"
+            "/upload — Get a web upload link (no size limit)\n"
+            "/download `<url>` — Download file from URL\n"
+            "/files — List your stored files\n"
+            "/search `<file_id>` `<pattern>` — Search text in a file\n"
+            "/unzip `<file_id>` `[password]` — Extract an archive\n"
+            "/delete `<file_id>` — Delete a file\n"
+            "/status — Show active jobs\n"
+            "/cancel `<job_id>` — Cancel a job\n"
+        )
+        await crud.get_or_create_user(
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.first_name,
+        )
+    except Exception:
+        log.exception("Error in /start handler")
 
 
 # ── /upload — Generate web upload link ───────────────────────────────
