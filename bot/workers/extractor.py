@@ -157,6 +157,38 @@ def _safe_keyword_filename(keyword: str) -> str:
     return cleaned[:80] or "keyword"
 
 
+def _human_bytes(n: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024  # type: ignore
+    return f"{n:.2f} PB"
+
+
+def _extract_credential(line: str) -> str | None:
+    """
+    Extract login:password from a ULP/logs line.
+
+    ULP format: URL:login:password  (or just login:password)
+    We take the last two colon-separated segments.
+    Returns 'login:password' or None if not enough parts.
+    """
+    parts = line.split(":")
+    if len(parts) < 2:
+        return None
+    login = parts[-2].strip()
+    password = parts[-1].strip()
+    if not login or not password:
+        return None
+    return f"{login}:{password}"
+
+
+def _bar(pct: float, length: int = 20) -> str:
+    filled = int(length * pct / 100)
+    return "█" * filled + "░" * (length - filled)
+
+
 async def extract_keywords_batch(
     ctx: dict,
     *,
@@ -168,7 +200,7 @@ async def extract_keywords_batch(
     status_message_id: int | None = None,
     mode: str,
 ) -> None:
-    """Scan multiple files for multiple keywords and send one txt per keyword."""
+    """Scan multiple files for multiple keywords using ripgrep. Extract credentials, deduplicate."""
     from bot.telegram.bot import app as tg
 
     await crud.update_job(job_id, status=JobStatus.RUNNING, progress=0)
@@ -188,7 +220,6 @@ async def extract_keywords_batch(
                 last_progress_text = text
                 return
             except Exception as e:
-                # Don't spam fallback messages for no-op edit errors.
                 if "MESSAGE_NOT_MODIFIED" in str(e):
                     return
 
@@ -206,134 +237,166 @@ async def extract_keywords_batch(
             await tg.send_message(chat_id, "❌ Cannot start: missing files or keywords.")
             return
 
-        await _set_progress(
-            f"🚀 {mode.upper()} pipeline started\n"
-            f"Files: {len(file_ids)} | Keywords: {len(keywords)}\n"
-            "Phase: Preparing\n"
-            "Overall Progress: 0%"
-        )
-
-        # Normalize keywords while preserving original text for filenames/captions.
+        # Normalize keywords
         deduped_keywords: list[str] = []
-        seen: set[str] = set()
+        seen_kw: set[str] = set()
         for kw in keywords:
             norm = kw.strip().lower()
-            if not norm or norm in seen:
+            if not norm or norm in seen_kw:
                 continue
-            seen.add(norm)
+            seen_kw.add(norm)
             deduped_keywords.append(kw.strip())
 
-        keyword_hits: dict[str, list[str]] = {kw: [] for kw in deduped_keywords}
+        # keyword -> set of credentials (deduplication)
+        keyword_creds: dict[str, set[str]] = {kw: set() for kw in deduped_keywords}
 
-        # Phase 1: wait for all files to finish downloading first.
         total_files = len(file_ids)
+
+        await _set_progress(
+            f"⬇️ **Downloading**\n"
+            f"{_bar(0)} 0%\n"
+            f"Files: 0/{total_files} ready\n"
+            f"Downloaded: 0 B / ?"
+        )
+
+        # ─── Phase 1: Wait for downloads ─────────────────────────
         wait_cycles = 0
         while True:
             wait_cycles += 1
             ready_count = 0
             error_count = 0
+            ready_bytes = 0
+            total_bytes = 0
             for fid in file_ids:
                 fr = await crud.get_file(fid)
                 if not fr:
                     continue
+                fsize = fr.size_bytes or 0
+                total_bytes += fsize
                 if fr.status == FileStatus.READY and fr.local_path:
                     ready_count += 1
+                    ready_bytes += fsize
                 elif fr.status == FileStatus.ERROR:
                     error_count += 1
 
-            if ready_count >= total_files:
+            if ready_count + error_count >= total_files:
                 break
 
-            download_progress = int((ready_count / max(1, total_files)) * 35)
+            pct = int((ready_bytes / max(1, total_bytes)) * 100) if total_bytes else 0
+            err_line = f"\n⚠️ Failed: {error_count}" if error_count else ""
             await _set_progress(
-                f"⏳ {mode.upper()} pipeline\n"
-                "Phase: Downloading files\n"
-                f"Overall Progress: {download_progress}%\n"
-                f"Ready files: {ready_count}/{total_files}\n"
-                f"Failed files: {error_count}"
+                f"⬇️ **Downloading**\n"
+                f"{_bar(pct)} {pct}%\n"
+                f"Files: {ready_count}/{total_files} ready\n"
+                f"Downloaded: {_human_bytes(ready_bytes)} / {_human_bytes(total_bytes)}"
+                f"{err_line}"
             )
             await asyncio.sleep(2)
 
-            # Safety stop (about 20 minutes)
-            if wait_cycles > 600:
+            if wait_cycles > 600:  # ~20 min safety stop
                 break
 
-        for file_idx, file_id in enumerate(file_ids, start=1):
-            file_record = await crud.get_file(file_id)
-            if not file_record:
+        # Gather file info for scanning phase
+        scan_files: list[tuple[str, Path, int]] = []  # (file_id, path, size)
+        for fid in file_ids:
+            fr = await crud.get_file(fid)
+            if not fr:
                 continue
 
-            if not file_record:
-                continue
+            filepath = Path(fr.local_path) if fr.local_path else None
 
-            filepath = Path(file_record.local_path) if file_record.local_path else None
-
-            # Restore from bucket if local copy is missing.
-            if (not filepath or not filepath.exists()) and file_record.bucket_key:
+            if (not filepath or not filepath.exists()) and fr.bucket_key:
                 from bot.storage import bucket, local
+                dest_dir = local.user_dir(user_id, str(fr.id))
+                filepath = dest_dir / fr.original_name
+                await bucket.download_file(fr.bucket_key, filepath)
+                await crud.update_file(fr.id, local_path=str(filepath))
 
-                dest_dir = local.user_dir(user_id, str(file_record.id))
-                filepath = dest_dir / file_record.original_name
-                await bucket.download_file(file_record.bucket_key, filepath)
-                await crud.update_file(file_record.id, local_path=str(filepath))
+            if filepath and filepath.exists():
+                scan_files.append((str(fr.id), filepath, fr.size_bytes or 0))
 
-            if not filepath or not filepath.exists():
-                continue
+        total_scan_bytes = sum(s for _, _, s in scan_files)
 
-            await _set_progress(
-                f"🔎 {mode.upper()} searching\n"
-                "Phase: Searching keywords\n"
-                f"Overall Progress: {35 + int((file_idx - 1) / max(1, len(file_ids)) * 55)}%\n"
-                f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})"
-            )
+        # ─── Phase 2: Scan with ripgrep ──────────────────────────
 
-            file_hits = 0
-            with filepath.open("r", encoding="utf-8", errors="replace") as fh:
-                for line_num, line in enumerate(fh, start=1):
-                    text = line.rstrip("\n")
-                    text_lower = text.lower()
+        # Write keywords to temp file for ripgrep -f
+        import tempfile
+        kw_tmp = Path(tempfile.mktemp(suffix=".txt", prefix="kw_"))
+        try:
+            kw_tmp.write_text("\n".join(deduped_keywords) + "\n", encoding="utf-8")
+
+            scanned_bytes = 0
+            for file_idx, (fid, filepath, fsize) in enumerate(scan_files, start=1):
+                pct = int((scanned_bytes / max(1, total_scan_bytes)) * 100)
+                kw_summary = " | ".join(
+                    f"{kw}: {len(keyword_creds[kw])}" for kw in deduped_keywords
+                )
+                await _set_progress(
+                    f"🔎 **Scanning**\n"
+                    f"{_bar(pct)} {pct}%\n"
+                    f"Scanned: {_human_bytes(scanned_bytes)} / {_human_bytes(total_scan_bytes)}\n"
+                    f"File {file_idx}/{len(scan_files)}: {filepath.name}\n"
+                    f"{kw_summary}"
+                )
+
+                # Run ripgrep: case-insensitive, patterns from file, no heading
+                proc = await asyncio.create_subprocess_exec(
+                    "rg",
+                    "-i",                # case insensitive
+                    "--no-heading",      # no filename header
+                    "--no-line-number",  # we only need the matched text
+                    "--no-messages",     # suppress file permission errors
+                    "-f", str(kw_tmp),   # patterns file
+                    str(filepath),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+
+                stdout, _ = await proc.communicate()
+
+                # Categorize each matched line into keywords and extract credentials
+                for raw_line in stdout.decode(errors="replace").splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    line_lower = stripped.lower()
+                    cred = _extract_credential(stripped)
+                    if not cred:
+                        continue
                     for kw in deduped_keywords:
-                        if kw.lower() in text_lower:
-                            keyword_hits[kw].append(
-                                f"{file_record.original_name}:{line_num}: {text}"
-                            )
-                            file_hits += 1
+                        if kw.lower() in line_lower:
+                            keyword_creds[kw].add(cred)
 
-                    # Show liveness progress even for one huge file.
-                    if line_num % 100000 == 0:
-                        total_hits_so_far = sum(len(v) for v in keyword_hits.values())
-                        await _set_progress(
-                            f"🔎 {mode.upper()} searching\n"
-                            "Phase: Searching keywords\n"
-                            f"Overall Progress: {35 + int((file_idx - 1) / max(1, len(file_ids)) * 55)}%\n"
-                            f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})\n"
-                            f"Lines scanned in current file: {line_num:,}\n"
-                            f"Hits found so far: {total_hits_so_far:,}"
-                        )
+                scanned_bytes += fsize
 
-            progress = 35 + int((file_idx / max(1, len(file_ids))) * 55)
-            await crud.update_job(job_id, progress=progress)
-            total_hits_so_far = sum(len(v) for v in keyword_hits.values())
-            await _set_progress(
-                f"🔎 {mode.upper()} scanning files\n"
-                "Phase: Searching keywords\n"
-                f"Overall Progress: {progress}%\n"
-                f"Processed files: {file_idx}/{len(file_ids)}\n"
-                f"Hits found so far: {total_hits_so_far:,}"
+            # Final scan progress
+            kw_summary = " | ".join(
+                f"{kw}: {len(keyword_creds[kw])}" for kw in deduped_keywords
             )
+            await _set_progress(
+                f"🔎 **Scanning**\n"
+                f"{_bar(100)} 100%\n"
+                f"Scanned: {_human_bytes(total_scan_bytes)} / {_human_bytes(total_scan_bytes)}\n"
+                f"Completed all {len(scan_files)} files\n"
+                f"{kw_summary}"
+            )
+        finally:
+            kw_tmp.unlink(missing_ok=True)
+
+        # ─── Phase 3: Generate and send result files ─────────────
 
         out_dir = PROCESSING_DIR / str(user_id) / "keyword_results"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         total_hits = 0
-        for idx, kw in enumerate(deduped_keywords, start=1):
-            lines = keyword_hits.get(kw, [])
-            total_hits += len(lines)
+        for kw in deduped_keywords:
+            creds = sorted(keyword_creds.get(kw, set()))
+            total_hits += len(creds)
 
             out_file = out_dir / f"{_safe_keyword_filename(kw)}.txt"
-            with out_file.open("w", encoding="utf-8", errors="replace") as f:
-                if lines:
-                    f.write("\n".join(lines))
+            with out_file.open("w", encoding="utf-8") as f:
+                if creds:
+                    f.write("\n".join(creds))
                     f.write("\n")
                 else:
                     f.write(f"No matches found for: {kw}\n")
@@ -341,49 +404,34 @@ async def extract_keywords_batch(
             await tg.send_document(
                 chat_id,
                 str(out_file),
-                caption=f"📄 `{kw}` — {len(lines)} match(es)",
+                caption=f"📄 `{kw}` — {len(creds)} result(s)",
             )
+            await asyncio.sleep(0.3)
 
-            keyword_progress = 90 + int((idx / len(deduped_keywords)) * 10)
-            await crud.update_job(job_id, progress=keyword_progress)
-            await _set_progress(
-                f"📤 Preparing result files\n"
-                "Phase: Sending result files\n"
-                f"Overall Progress: {keyword_progress}%\n"
-                f"Generated: {idx}/{len(deduped_keywords)} keyword files"
-            )
+        # ─── Done: edit progress to final summary ────────────────
 
         await crud.update_job(
             job_id,
             status=JobStatus.COMPLETED,
             progress=100,
-            result=f"keywords={len(deduped_keywords)}, files={len(file_ids)}, hits={total_hits}",
+            result=f"keywords={len(deduped_keywords)}, files={len(scan_files)}, hits={total_hits}",
         )
 
-        counts_lines = [
-            f"• {kw}: {len(keyword_hits.get(kw, []))}"
+        counts_lines = "\n".join(
+            f"• {kw}: {len(keyword_creds.get(kw, set()))}"
             for kw in deduped_keywords
-        ]
-        await tg.send_message(
-            chat_id,
-            "📊 Lines found per keyword:\n" + "\n".join(counts_lines),
-        )
-
-        await tg.send_message(
-            chat_id,
-            f"✅ Done. Scanned {len(file_ids)} file(s), {len(deduped_keywords)} keyword(s), {total_hits} total hit(s).",
         )
         await _set_progress(
-            f"✅ Completed\n"
-            "Phase: Done\n"
-            f"Overall Progress: 100%\n"
-            f"Files: {len(file_ids)} | Keywords: {len(deduped_keywords)} | Hits: {total_hits}"
+            f"✅ **Done**\n\n"
+            f"Scanned **{len(scan_files)}** file(s) ({_human_bytes(total_scan_bytes)})\n"
+            f"Keywords: **{len(deduped_keywords)}** | Results: **{total_hits:,}**\n\n"
+            f"{counts_lines}"
         )
 
     except Exception as e:
         log.exception("extract_keywords_batch failed: %s", e)
         await crud.update_job(job_id, status=JobStatus.FAILED, error_message=str(e))
         try:
-            await tg.send_message(chat_id, f"❌ Batch extraction failed: `{e}`")
+            await tg.send_message(chat_id, f"❌ Scan failed: `{e}`")
         except Exception:
             pass

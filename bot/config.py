@@ -27,7 +27,6 @@ PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Limits ---
 MAX_FILE_SIZE_GB: int = int(os.environ.get("MAX_FILE_SIZE_GB", "50"))
-MAX_CONCURRENT_DOWNLOADS: int = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
 VOLUME_WARN_GB: int = int(os.environ.get("VOLUME_WARN_GB", "200"))
 VOLUME_MAX_GB: int = int(os.environ.get("VOLUME_MAX_GB", "240"))
 
@@ -50,4 +49,4 @@ ALLOWED_USERS: set[int] = (
 )
 
 # --- ARQ workers ---
-ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "8"))
+ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "20"))

@@ -22,7 +22,8 @@ async def download_telegram_file(
     original_name: str,
     job_id: str,
     chat_id: int,
-    status_message_id: int,
+    status_message_id: int | None = None,
+    silent: bool = False,
 ) -> None:
     """Download a file from Telegram via Pyrogram (MTProto, chunked)."""
     from bot.telegram.bot import app as tg
@@ -35,9 +36,10 @@ async def download_telegram_file(
     await crud.update_file(file_id, status=FileStatus.DOWNLOADING)
 
     try:
-        # Get status message for progress updates
-        msg = await tg.get_messages(chat_id, status_message_id)
-        tracker = ProgressTracker(msg, action="⬇️ Downloading from Telegram")
+        tracker = None
+        if not silent and status_message_id:
+            msg = await tg.get_messages(chat_id, status_message_id)
+            tracker = ProgressTracker(msg, action="⬇️ Downloading from Telegram")
 
         await tg.download_media(
             telegram_file_id,
@@ -60,25 +62,27 @@ async def download_telegram_file(
         )
         await crud.update_job(job_id, status=JobStatus.COMPLETED, progress=100)
 
-        await tg.send_message(
-            chat_id,
-            f"✅ **Download complete!**\n"
-            f"📄 `{original_name}`\n"
-            f"📦 Size: {_human(size)}\n"
-            f"🔑 File ID: `{file_id}`\n\n"
-            f"Use `/search {file_id} <pattern>` to search\n"
-            f"Use `/unzip {file_id}` to extract archives",
-        )
+        if not silent:
+            await tg.send_message(
+                chat_id,
+                f"✅ **Download complete!**\n"
+                f"📄 `{original_name}`\n"
+                f"📦 Size: {_human(size)}\n"
+                f"🔑 File ID: `{file_id}`\n\n"
+                f"Use `/search {file_id} <pattern>` to search\n"
+                f"Use `/unzip {file_id}` to extract archives",
+            )
     except Exception as e:
         log.exception("Telegram download failed: %s", e)
         await crud.update_file(file_id, status=FileStatus.ERROR, error_message=str(e))
         await crud.update_job(
             job_id, status=JobStatus.FAILED, error_message=str(e)
         )
-        try:
-            await tg.send_message(chat_id, f"❌ Download failed: `{e}`")
-        except Exception:
-            pass
+        if not silent:
+            try:
+                await tg.send_message(chat_id, f"❌ Download failed: `{e}`")
+            except Exception:
+                pass
 
 
 async def download_url(

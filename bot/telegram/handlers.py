@@ -10,11 +10,10 @@ from urllib.parse import urlparse
 from pyrogram import filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.config import ALLOWED_USERS, MAX_CONCURRENT_DOWNLOADS
+from bot.config import ALLOWED_USERS
 from bot.db import crud
 from bot.db.models import FileStatus, JobStatus, JobType
 from bot.telegram.bot import app
-from bot.telegram.progress import ProgressTracker
 
 log = logging.getLogger(__name__)
 
@@ -187,13 +186,6 @@ async def cmd_download(_, message: Message):
     if parsed.scheme not in ("http", "https", "ftp"):
         return await message.reply("❌ Invalid URL. Must be http/https/ftp.")
 
-    # Check concurrent downloads
-    active = await crud.count_active_jobs(message.from_user.id)
-    if active >= MAX_CONCURRENT_DOWNLOADS:
-        return await message.reply(
-            f"⏳ You have {active} active jobs. Max is {MAX_CONCURRENT_DOWNLOADS}. Wait or `/cancel` one."
-        )
-
     # Derive filename from URL
     original_name = Path(parsed.path).name or "download"
 
@@ -241,12 +233,6 @@ async def on_document(_, message: Message):
     doc = message.document
     original_name = doc.file_name or f"file_{doc.file_id}"
 
-    active = await crud.count_active_jobs(message.from_user.id)
-    if active >= MAX_CONCURRENT_DOWNLOADS:
-        return await message.reply(
-            f"⏳ You have {active} active jobs. Max is {MAX_CONCURRENT_DOWNLOADS}."
-        )
-
     await crud.get_or_create_user(
         message.from_user.id,
         message.from_user.username,
@@ -265,32 +251,32 @@ async def on_document(_, message: Message):
         file_id=file_record.id,
     )
 
-    status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
+    # Check if we're in a guided flow — download silently
+    session = guided_sessions.get(message.from_user.id)
+    in_guided = session and session.state in {"waiting_files", "waiting_confirm"}
 
     from bot.workers._arq import enqueue
 
-    await enqueue(
-        "download_telegram_file",
-        user_id=message.from_user.id,
-        file_id=str(file_record.id),
-        telegram_file_id=doc.file_id,
-        original_name=original_name,
-        job_id=str(job.id),
-        chat_id=message.chat.id,
-        status_message_id=status_msg.id,
-    )
+    if in_guided:
+        # Silent download: no progress messages, no completion message
+        await enqueue(
+            "download_telegram_file",
+            user_id=message.from_user.id,
+            file_id=str(file_record.id),
+            telegram_file_id=doc.file_id,
+            original_name=original_name,
+            job_id=str(job.id),
+            chat_id=message.chat.id,
+            silent=True,
+        )
 
-    # Guided flow: collect files and ask whether to add more
-    session = guided_sessions.get(message.from_user.id)
-    if session and session.state in {"waiting_files", "waiting_confirm"}:
         if len(session.file_ids) >= MAX_GUIDED_FILES:
             return await message.reply(
-                f"⚠️ Max {MAX_GUIDED_FILES} files in one guided run reached. Tap Done Adding Files."
+                f"⚠️ Max {MAX_GUIDED_FILES} files reached. Tap Done Adding Files."
             )
 
         session.file_ids.append(str(file_record.id))
         session.state = "waiting_confirm"
-        mode_label = (session.mode or "ulp").upper()
 
         kb = InlineKeyboardMarkup(
             [
@@ -302,9 +288,21 @@ async def on_document(_, message: Message):
             ]
         )
         await message.reply(
-            f"✅ Added file {len(session.file_ids)} for **{mode_label}**.\n"
-            "Send more files or tap Done Adding Files.",
+            f"📎 File {len(session.file_ids)} added.",
             reply_markup=kb,
+        )
+    else:
+        # Non-guided: full progress + completion message
+        status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
+        await enqueue(
+            "download_telegram_file",
+            user_id=message.from_user.id,
+            file_id=str(file_record.id),
+            telegram_file_id=doc.file_id,
+            original_name=original_name,
+            job_id=str(job.id),
+            chat_id=message.chat.id,
+            status_message_id=status_msg.id,
         )
 
 
@@ -458,6 +456,40 @@ async def cmd_delete(_, message: Message):
     await message.reply(f"🗑️ File `{file_record.original_name}` deleted.")
 
 
+# ── /scan — Scan all stored files ────────────────────────────────────
+
+
+@app.on_message(filters.command("scan") & filters.private)
+async def cmd_scan(_, message: Message):
+    if not _authorized(message.from_user.id):
+        return await message.reply("⛔ You are not authorized.")
+
+    await crud.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+    )
+
+    files = await crud.list_user_files(message.from_user.id)
+    if not files:
+        return await message.reply("📂 No files stored. Send files first or use /start.")
+
+    total_bytes = sum(f.size_bytes or 0 for f in files)
+    total_gb = total_bytes / (1024 ** 3)
+    file_ids = [str(f.id) for f in files]
+
+    session = GuidedSession()
+    session.state = "waiting_keywords"
+    session.mode = "ulp"
+    session.file_ids = file_ids
+    guided_sessions[message.from_user.id] = session
+
+    await message.reply(
+        f"📊 **{len(files)} files** stored — **{total_gb:.2f} GB** total.\n\n"
+        "Send keywords to scan (one per line):"
+    )
+
+
 # ── /status — Active jobs ────────────────────────────────────────────
 
 
@@ -504,7 +536,7 @@ async def cmd_cancel(_, message: Message):
     await message.reply(f"🛑 Job `{jid}` cancelled.")
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan"]))
 async def on_guided_keywords(_, message: Message):
     try:
         user_id = message.from_user.id
