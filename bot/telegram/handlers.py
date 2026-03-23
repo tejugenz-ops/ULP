@@ -1,5 +1,6 @@
 """Telegram bot command and message handlers."""
 
+import asyncio
 import logging
 import secrets
 import uuid
@@ -33,7 +34,11 @@ class GuidedSession:
 
 guided_sessions: dict[int, GuidedSession] = {}
 
-MAX_GUIDED_FILES = 50
+# Track the "files added" button message per user so we can edit it instead of
+# flooding the chat with one message per file.
+_file_button_msg: dict[int, int] = {}  # user_id → message_id
+
+MAX_GUIDED_FILES = 999
 MAX_GUIDED_KEYWORDS = 200
 
 
@@ -53,6 +58,7 @@ async def cmd_start(_, message: Message):
         return await message.reply("⛔ You are not authorized.")
     try:
         guided_sessions[message.from_user.id] = GuidedSession()
+        _file_button_msg.pop(message.from_user.id, None)
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -89,14 +95,12 @@ async def on_mode_selected(_, callback: CallbackQuery):
     guided_sessions[user_id] = session
 
     await callback.message.reply(
-        f"✅ Mode selected: **{mode.upper()}**\n\n"
-        "Now send one or more files.\n"
-        "When done, tap **Done Adding Files**."
+        f"✅ Mode: **{mode.upper()}** — Send your files."
     )
     await callback.answer()
 
 
-@app.on_callback_query(filters.regex(r"^files:(add_more|done|cancel)$"))
+@app.on_callback_query(filters.regex(r"^files:(done|cancel)$"))
 async def on_files_action(_, callback: CallbackQuery):
     user_id = callback.from_user.id
     session = guided_sessions.get(user_id)
@@ -106,15 +110,10 @@ async def on_files_action(_, callback: CallbackQuery):
 
     action = callback.data.split(":", 1)[1]
 
-    if action == "add_more":
-        session.state = "waiting_files"
-        await callback.message.reply("📤 Send remaining files.")
-        await callback.answer()
-        return
-
     if action == "cancel":
         guided_sessions[user_id] = GuidedSession()
-        await callback.message.reply("❎ Guided flow cancelled. Use /start to begin again.")
+        _file_button_msg.pop(user_id, None)
+        await callback.message.edit_text("❎ Cancelled.")
         await callback.answer()
         return
 
@@ -124,20 +123,12 @@ async def on_files_action(_, callback: CallbackQuery):
         return
 
     session.state = "waiting_keywords"
-    ready_count = 0
-    for fid in session.file_ids:
-        fr = await crud.get_file(fid)
-        if fr and fr.status == FileStatus.READY:
-            ready_count += 1
-    await callback.message.reply(
-        f"📦 Files collected: {len(session.file_ids)} (ready: {ready_count}, downloading: {len(session.file_ids) - ready_count})\n\n"
-        "🧾 Send domains/keywords, one per line.\n\n"
-        "Example:\n"
-        "amazon\n"
-        "netflix\n"
-        "optifine"
+    _file_button_msg.pop(user_id, None)
+    await callback.message.edit_text(
+        f"📦 **{len(session.file_ids)}** file(s) collected.\n\n"
+        "Send keywords/domains to search (one per line):"
     )
-    await callback.answer("Now send keywords/domains")
+    await callback.answer()
 
 
 # ── /upload — Generate web upload link ───────────────────────────────
@@ -270,27 +261,33 @@ async def on_document(_, message: Message):
             silent=True,
         )
 
-        if len(session.file_ids) >= MAX_GUIDED_FILES:
-            return await message.reply(
-                f"⚠️ Max {MAX_GUIDED_FILES} files reached. Tap Done Adding Files."
-            )
-
         session.file_ids.append(str(file_record.id))
         session.state = "waiting_confirm"
 
         kb = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Add More", callback_data="files:add_more"),
-                    InlineKeyboardButton("Done Adding Files", callback_data="files:done"),
+                    InlineKeyboardButton("Done — these were all files", callback_data="files:done"),
                 ],
                 [InlineKeyboardButton("Cancel", callback_data="files:cancel")],
             ]
         )
-        await message.reply(
-            f"📎 File {len(session.file_ids)} added.",
-            reply_markup=kb,
-        )
+        text = f"📎 **{len(session.file_ids)}** file(s) added. Send more or tap Done."
+
+        # Edit the existing button message instead of sending a new one per file
+        prev_msg_id = _file_button_msg.get(message.from_user.id)
+        if prev_msg_id:
+            try:
+                await app.edit_message_text(
+                    message.chat.id, prev_msg_id, text, reply_markup=kb,
+                )
+            except Exception:
+                # Message may have been deleted or too old — send a new one
+                sent = await message.reply(text, reply_markup=kb)
+                _file_button_msg[message.from_user.id] = sent.id
+        else:
+            sent = await message.reply(text, reply_markup=kb)
+            _file_button_msg[message.from_user.id] = sent.id
     else:
         # Non-guided: full progress + completion message
         status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
