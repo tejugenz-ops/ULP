@@ -1,12 +1,14 @@
 FROM python:3.12-slim
 
-# Install system dependencies for fast file processing
+# Install system dependencies for fast file processing + gcc for tgcrypto
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     aria2 \
     p7zip-full \
     unrar-free \
     curl \
+    gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
