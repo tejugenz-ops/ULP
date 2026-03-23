@@ -142,12 +142,22 @@ async def extract_keywords_batch(
     keywords: list[str],
     job_id: str,
     chat_id: int,
+    status_message_id: int | None = None,
     mode: str,
 ) -> None:
     """Scan multiple files for multiple keywords and send one txt per keyword."""
     from bot.telegram.bot import app as tg
 
     await crud.update_job(job_id, status=JobStatus.RUNNING, progress=0)
+
+    async def _set_progress(text: str) -> None:
+        if status_message_id:
+            try:
+                await tg.edit_message_text(chat_id, status_message_id, text)
+                return
+            except Exception:
+                pass
+        await tg.send_message(chat_id, text)
 
     try:
         if not file_ids or not keywords:
@@ -159,9 +169,10 @@ async def extract_keywords_batch(
             await tg.send_message(chat_id, "❌ Cannot start: missing files or keywords.")
             return
 
-        await tg.send_message(
-            chat_id,
-            f"🔎 Starting {mode.upper()} scan for {len(keywords)} keyword(s) across {len(file_ids)} file(s)...",
+        await _set_progress(
+            f"🔎 {mode.upper()} scan started\n"
+            f"Files: {len(file_ids)} | Keywords: {len(keywords)}\n"
+            "Progress: 0%"
         )
 
         # Normalize keywords while preserving original text for filenames/captions.
@@ -207,6 +218,11 @@ async def extract_keywords_batch(
 
             progress = int((file_idx / max(1, len(file_ids))) * 80)
             await crud.update_job(job_id, progress=progress)
+            await _set_progress(
+                f"🔎 {mode.upper()} scanning files\n"
+                f"Progress: {progress}%\n"
+                f"Processed files: {file_idx}/{len(file_ids)}"
+            )
 
         out_dir = PROCESSING_DIR / str(user_id) / "keyword_results"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -230,7 +246,13 @@ async def extract_keywords_batch(
                 caption=f"📄 `{kw}` — {len(lines)} match(es)",
             )
 
-            await crud.update_job(job_id, progress=80 + int((idx / len(deduped_keywords)) * 20))
+            keyword_progress = 80 + int((idx / len(deduped_keywords)) * 20)
+            await crud.update_job(job_id, progress=keyword_progress)
+            await _set_progress(
+                f"📤 Preparing result files\n"
+                f"Progress: {keyword_progress}%\n"
+                f"Generated: {idx}/{len(deduped_keywords)} keyword files"
+            )
 
         await crud.update_job(
             job_id,
@@ -242,6 +264,12 @@ async def extract_keywords_batch(
             chat_id,
             f"✅ Done. Scanned {len(file_ids)} file(s), {len(deduped_keywords)} keyword(s), {total_hits} total hit(s).",
         )
+        if status_message_id:
+            await _set_progress(
+                f"✅ Completed\n"
+                f"Progress: 100%\n"
+                f"Files: {len(file_ids)} | Keywords: {len(deduped_keywords)} | Hits: {total_hits}"
+            )
 
     except Exception as e:
         log.exception("extract_keywords_batch failed: %s", e)

@@ -541,8 +541,9 @@ async def on_guided_keywords(_, message: Message):
         file_id=primary_file_id,
     )
 
-    await message.reply(
-        f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)..."
+    status_msg = await message.reply(
+        f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
+        "Progress: 0%"
     )
 
     from bot.workers._arq import enqueue
@@ -554,6 +555,7 @@ async def on_guided_keywords(_, message: Message):
         keywords=keywords,
         job_id=str(job.id),
         chat_id=message.chat.id,
+        status_message_id=status_msg.id,
         mode=mode,
     )
 
