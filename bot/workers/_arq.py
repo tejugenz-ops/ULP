@@ -36,7 +36,7 @@ async def enqueue(func_name: str, **kwargs) -> None:
 # ── Worker class (used by ARQ worker process) ────────────────────────
 
 from bot.workers.downloader import download_telegram_file, download_url
-from bot.workers.extractor import search_file
+from bot.workers.extractor import extract_keywords_batch, search_file
 from bot.workers.decompressor import extract_archive
 
 
@@ -47,6 +47,7 @@ class WorkerSettings:
         download_telegram_file,
         download_url,
         search_file,
+        extract_keywords_batch,
         extract_archive,
     ]
     redis_settings = _parse_redis_url(REDIS_URL)

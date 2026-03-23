@@ -36,6 +36,8 @@ class JobType(str, enum.Enum):
     UPLOAD_WEB = "upload_web"
     SEARCH = "search"
     EXTRACT = "extract"
+    ULP_EXTRACT = "ulp_extract"
+    LOGS_EXTRACT = "logs_extract"
 
 
 class JobStatus(str, enum.Enum):

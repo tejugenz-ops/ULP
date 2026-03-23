@@ -3,11 +3,12 @@
 import logging
 import secrets
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 from pyrogram import filters
-from pyrogram.types import Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.config import ALLOWED_USERS, MAX_CONCURRENT_DOWNLOADS
 from bot.db import crud
@@ -22,6 +23,19 @@ log = logging.getLogger(__name__)
 import time
 
 upload_tokens: dict[str, dict] = {}  # token → {"user_id": int, "expires": float}
+
+
+@dataclass
+class GuidedSession:
+    state: str = "idle"  # idle|waiting_files|waiting_confirm|waiting_keywords|processing
+    mode: str | None = None  # ulp|logs
+    file_ids: list[str] = field(default_factory=list)
+
+
+guided_sessions: dict[int, GuidedSession] = {}
+
+MAX_GUIDED_FILES = 50
+MAX_GUIDED_KEYWORDS = 200
 
 
 def _authorized(user_id: int) -> bool:
@@ -39,18 +53,19 @@ async def cmd_start(_, message: Message):
     if not _authorized(message.from_user.id):
         return await message.reply("⛔ You are not authorized.")
     try:
+        guided_sessions[message.from_user.id] = GuidedSession()
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("ULP", callback_data="mode:ulp")],
+                [InlineKeyboardButton("Logs", callback_data="mode:logs")],
+            ]
+        )
+
         await message.reply(
-            "👋 **File Processing Bot**\n\n"
-            "Send me any file (up to 4 GB via Telegram) and I'll process it.\n\n"
-            "**Commands:**\n"
-            "/upload — Get a web upload link (no size limit)\n"
-            "/download `<url>` — Download file from URL\n"
-            "/files — List your stored files\n"
-            "/search `<file_id>` `<pattern>` — Search text in a file\n"
-            "/unzip `<file_id>` `[password]` — Extract an archive\n"
-            "/delete `<file_id>` — Delete a file\n"
-            "/status — Show active jobs\n"
-            "/cancel `<job_id>` — Cancel a job\n"
+            "👋 **Choose Mode**\n\n"
+            "Pick one option to start guided processing:",
+            reply_markup=keyboard,
         )
         await crud.get_or_create_user(
             message.from_user.id,
@@ -59,6 +74,65 @@ async def cmd_start(_, message: Message):
         )
     except Exception:
         log.exception("Error in /start handler")
+
+
+@app.on_callback_query(filters.regex(r"^mode:(ulp|logs)$"))
+async def on_mode_selected(_, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not _authorized(user_id):
+        return await callback.answer("Not authorized", show_alert=True)
+
+    mode = callback.data.split(":", 1)[1]
+    session = guided_sessions.get(user_id, GuidedSession())
+    session.mode = mode
+    session.state = "waiting_files"
+    session.file_ids.clear()
+    guided_sessions[user_id] = session
+
+    await callback.message.reply(
+        f"✅ Mode selected: **{mode.upper()}**\n\n"
+        "Now send one or more files.\n"
+        "When done, tap **Done Adding Files**."
+    )
+    await callback.answer()
+
+
+@app.on_callback_query(filters.regex(r"^files:(add_more|done|cancel)$"))
+async def on_files_action(_, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    session = guided_sessions.get(user_id)
+    if not session:
+        await callback.answer("Start with /start first", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+
+    if action == "add_more":
+        session.state = "waiting_files"
+        await callback.message.reply("📤 Send remaining files.")
+        await callback.answer()
+        return
+
+    if action == "cancel":
+        guided_sessions[user_id] = GuidedSession()
+        await callback.message.reply("❎ Guided flow cancelled. Use /start to begin again.")
+        await callback.answer()
+        return
+
+    # done
+    if not session.file_ids:
+        await callback.answer("Send at least one file first.", show_alert=True)
+        return
+
+    session.state = "waiting_keywords"
+    await callback.message.reply(
+        "🧾 Send domains/keywords, one per line.\n\n"
+        "Example:\n"
+        "amazon\n"
+        "netflix\n"
+        "optifine"
+    )
+    await callback.answer("Now send keywords/domains")
 
 
 # ── /upload — Generate web upload link ───────────────────────────────
@@ -199,6 +273,33 @@ async def on_document(_, message: Message):
         chat_id=message.chat.id,
         status_message_id=status_msg.id,
     )
+
+    # Guided flow: collect files and ask whether to add more
+    session = guided_sessions.get(message.from_user.id)
+    if session and session.state in {"waiting_files", "waiting_confirm"}:
+        if len(session.file_ids) >= MAX_GUIDED_FILES:
+            return await message.reply(
+                f"⚠️ Max {MAX_GUIDED_FILES} files in one guided run reached. Tap Done Adding Files."
+            )
+
+        session.file_ids.append(str(file_record.id))
+        session.state = "waiting_confirm"
+        mode_label = (session.mode or "ulp").upper()
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Add More", callback_data="files:add_more"),
+                    InlineKeyboardButton("Done Adding Files", callback_data="files:done"),
+                ],
+                [InlineKeyboardButton("Cancel", callback_data="files:cancel")],
+            ]
+        )
+        await message.reply(
+            f"✅ Added file {len(session.file_ids)} for **{mode_label}**.\n"
+            "Send more files or tap Done Adding Files.",
+            reply_markup=kb,
+        )
 
 
 # ── /files — List user's files ───────────────────────────────────────
@@ -394,6 +495,70 @@ async def cmd_cancel(_, message: Message):
 
     await crud.update_job(jid, status=JobStatus.CANCELLED)
     await message.reply(f"🛑 Job `{jid}` cancelled.")
+
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel"]))
+async def on_guided_keywords(_, message: Message):
+    user_id = message.from_user.id
+    session = guided_sessions.get(user_id)
+    if not session or session.state != "waiting_keywords":
+        return
+
+    lines = [line.strip() for line in (message.text or "").splitlines()]
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if not line:
+            continue
+        norm = line.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        keywords.append(line)
+
+    if not keywords:
+        await message.reply("❌ No valid keywords found. Send one keyword/domain per line.")
+        return
+
+    if len(keywords) > MAX_GUIDED_KEYWORDS:
+        await message.reply(f"❌ Too many keywords. Max is {MAX_GUIDED_KEYWORDS}.")
+        return
+
+    if not session.file_ids:
+        await message.reply("❌ No files collected. Use /start and send files first.")
+        session.state = "idle"
+        return
+
+    session.state = "processing"
+    mode = session.mode or "ulp"
+    mode_label = mode.upper()
+
+    primary_file_id = session.file_ids[0] if session.file_ids else None
+    job_type = JobType.ULP_EXTRACT if mode == "ulp" else JobType.LOGS_EXTRACT
+    job = await crud.create_job(
+        user_id=user_id,
+        job_type=job_type,
+        file_id=primary_file_id,
+    )
+
+    await message.reply(
+        f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)..."
+    )
+
+    from bot.workers._arq import enqueue
+
+    await enqueue(
+        "extract_keywords_batch",
+        user_id=user_id,
+        file_ids=session.file_ids,
+        keywords=keywords,
+        job_id=str(job.id),
+        chat_id=message.chat.id,
+        mode=mode,
+    )
+
+    # Reset for next /start flow.
+    guided_sessions[user_id] = GuidedSession()
 
 
 # ── Helper ───────────────────────────────────────────────────────────
