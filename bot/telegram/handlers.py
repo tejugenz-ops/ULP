@@ -125,7 +125,13 @@ async def on_files_action(_, callback: CallbackQuery):
         return
 
     session.state = "waiting_keywords"
+    ready_count = 0
+    for fid in session.file_ids:
+        fr = await crud.get_file(fid)
+        if fr and fr.status == FileStatus.READY:
+            ready_count += 1
     await callback.message.reply(
+        f"📦 Files collected: {len(session.file_ids)} (ready: {ready_count}, downloading: {len(session.file_ids) - ready_count})\n\n"
         "🧾 Send domains/keywords, one per line.\n\n"
         "Example:\n"
         "amazon\n"
@@ -355,7 +361,7 @@ async def cmd_search(_, message: Message):
         file_id=uuid.UUID(file_id),
     )
 
-    await message.reply(f"🔍 Searching for `{pattern}`...")
+    status_msg = await message.reply(f"🔍 Searching for `{pattern}`...\nProgress: 0%")
 
     from bot.workers._arq import enqueue
 
@@ -366,6 +372,7 @@ async def cmd_search(_, message: Message):
         pattern=pattern,
         job_id=str(job.id),
         chat_id=message.chat.id,
+        status_message_id=status_msg.id,
     )
 
 

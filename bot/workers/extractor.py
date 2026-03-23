@@ -24,6 +24,7 @@ async def search_file(
     pattern: str,
     job_id: str,
     chat_id: int,
+    status_message_id: int | None = None,
 ) -> None:
     """
     Search a file using ripgrep.
@@ -32,6 +33,15 @@ async def search_file(
     from bot.telegram.bot import app as tg
 
     await crud.update_job(job_id, status=JobStatus.RUNNING, progress=0)
+
+    async def _set_progress(text: str) -> None:
+        if status_message_id:
+            try:
+                await tg.edit_message_text(chat_id, status_message_id, text)
+                return
+            except Exception:
+                pass
+        await tg.send_message(chat_id, text)
 
     try:
         file_record = await crud.get_file(file_id)
@@ -56,6 +66,13 @@ async def search_file(
             await tg.send_message(chat_id, "❌ File not found.")
             await crud.update_job(job_id, status=JobStatus.FAILED, error_message="File missing")
             return
+
+        await _set_progress(
+            f"🔍 Searching started\n"
+            f"Pattern: `{pattern}`\n"
+            f"File: `{file_record.original_name}`\n"
+            "Progress: 20%"
+        )
 
         # Run ripgrep — JSON output, max results cap, case-insensitive
         proc = await asyncio.create_subprocess_exec(
@@ -88,6 +105,12 @@ async def search_file(
                 continue
 
         await crud.update_job(job_id, progress=100, status=JobStatus.COMPLETED)
+        await _set_progress(
+            f"✅ Search completed\n"
+            f"Pattern: `{pattern}`\n"
+            f"File: `{file_record.original_name}`\n"
+            f"Progress: 100% | Matches: {len(matches)}"
+        )
 
         if not matches:
             await tg.send_message(
@@ -221,6 +244,12 @@ async def extract_keywords_batch(
             if not filepath or not filepath.exists():
                 continue
 
+            await _set_progress(
+                f"🔎 {mode.upper()} searching\n"
+                f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
+                f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})"
+            )
+
             with filepath.open("r", encoding="utf-8", errors="replace") as fh:
                 for line_num, line in enumerate(fh, start=1):
                     text = line.rstrip("\n")
@@ -230,6 +259,15 @@ async def extract_keywords_batch(
                             keyword_hits[kw].append(
                                 f"{file_record.original_name}:{line_num}: {text}"
                             )
+
+                    # Show liveness progress even for one huge file.
+                    if line_num % 100000 == 0:
+                        await _set_progress(
+                            f"🔎 {mode.upper()} searching\n"
+                            f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
+                            f"Now scanning: {file_record.original_name} ({file_idx}/{len(file_ids)})\n"
+                            f"Lines scanned in current file: {line_num:,}"
+                        )
 
             progress = int((file_idx / max(1, len(file_ids))) * 80)
             await crud.update_job(job_id, progress=progress)
