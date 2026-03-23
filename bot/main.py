@@ -1,14 +1,14 @@
 """
-Entry point — starts Pyrogram bot + FastAPI web server + ARQ worker
-all in a single process for Railway deployment.
+Entry point — starts Pyrogram bot + FastAPI web server + ARQ worker.
+Pyrogram runs as the primary async loop owner; FastAPI runs in a thread.
 """
 
 import asyncio
 import logging
-import signal
+import threading
+from urllib.request import urlopen
 
 import uvicorn
-from arq import create_pool
 
 from bot.config import REDIS_URL
 from bot.db.models import init_db
@@ -23,16 +23,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-async def run_arq_worker():
-    """Run ARQ worker in-process (no separate process needed)."""
-    from arq.worker import create_worker
-
-    worker = create_worker(WorkerSettings)
-    await worker.async_run()
-
-
-async def run_web_server():
-    """Run FastAPI via uvicorn programmatically."""
+def start_web_server():
+    """Run FastAPI/uvicorn in a daemon thread."""
     config = uvicorn.Config(
         web_app,
         host="0.0.0.0",
@@ -41,77 +33,69 @@ async def run_web_server():
         access_log=False,
     )
     server = uvicorn.Server(config)
-    await server.serve()
+    server.run()
 
 
-async def run_telegram():
-    """Start Pyrogram and keep it alive."""
-    # Import handlers to register them with the Pyrogram client
-    import bot.telegram.handlers  # noqa: F401
+async def start_arq_worker():
+    """Start ARQ worker as a background task."""
+    from arq.worker import create_worker
 
-    await tg_app.start()
-
-    # Verify bot identity
-    me = await tg_app.get_me()
-    log.info("Bot authenticated as @%s (id=%s)", me.username, me.id)
-
-    # Delete any existing webhook that might intercept updates
-    try:
-        from urllib.request import urlopen
-        token = tg_app.bot_token
-        with urlopen(f"https://api.telegram.org/bot{token}/deleteWebhook") as resp:
-            log.info("deleteWebhook result: %s", resp.read().decode())
-    except Exception as e:
-        log.warning("Could not delete webhook: %s", e)
-
-    log.info("Telegram bot started, waiting for messages...")
-
-    # Keep alive until cancelled — Pyrogram needs the event loop running
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        await tg_app.stop()
+    worker = create_worker(WorkerSettings)
+    await worker.async_run()
 
 
 async def main():
     log.info("Initializing database...")
     await init_db()
 
-    log.info("Starting services...")
+    # Import handlers to register them BEFORE starting the client
+    import bot.telegram.handlers  # noqa: F401
+    log.info("Handlers registered: %s", [
+        type(h).__name__ for g in tg_app.dispatcher.groups.values() for h in g
+    ])
 
-    # Start all three services concurrently
-    await asyncio.gather(
-        run_telegram(),        # Pyrogram bot (MTProto)
-        run_web_server(),      # FastAPI (HTTP)
-        run_arq_worker(),      # ARQ job worker
-    )
+    # Start FastAPI in a daemon thread (won't block asyncio loop)
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+    log.info("Web server started in background thread on :8080")
 
+    # Start ARQ worker as background task
+    arq_task = asyncio.create_task(start_arq_worker())
+    log.info("ARQ worker started")
 
-def _shutdown(sig, loop):
-    log.info("Received %s, shutting down...", sig.name)
-    for task in asyncio.all_tasks(loop):
-        task.cancel()
+    # Start Pyrogram bot
+    log.info("Starting Telegram bot...")
+    await tg_app.start()
+
+    me = await tg_app.get_me()
+    log.info("Bot authenticated as @%s (id=%s)", me.username, me.id)
+
+    # Delete any webhook that might steal updates
+    try:
+        token = tg_app.bot_token
+        with urlopen(f"https://api.telegram.org/bot{token}/deleteWebhook") as resp:
+            log.info("deleteWebhook: %s", resp.read().decode())
+    except Exception as e:
+        log.warning("Could not delete webhook: %s", e)
+
+    # Check pending updates via Bot API
+    try:
+        token = tg_app.bot_token
+        with urlopen(f"https://api.telegram.org/bot{token}/getWebhookInfo") as resp:
+            log.info("getWebhookInfo: %s", resp.read().decode())
+    except Exception as e:
+        log.warning("Could not get webhook info: %s", e)
+
+    log.info("Bot is running! Send /start to test.")
+
+    # Use Pyrogram's idle to keep the bot alive
+    from pyrogram import idle
+    await idle()
+
+    # Cleanup
+    await tg_app.stop()
+    arq_task.cancel()
 
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _shutdown, sig, loop)
-        except NotImplementedError:
-            pass  # Windows doesn't support add_signal_handler
-
-    try:
-        loop.run_until_complete(main())
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Shutting down gracefully...")
-    finally:
-        # Stop Pyrogram cleanly
-        try:
-            loop.run_until_complete(tg_app.stop())
-        except Exception:
-            pass
-        loop.close()
+    tg_app.run(main())
