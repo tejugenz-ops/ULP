@@ -50,6 +50,20 @@ async def run_telegram():
     import bot.telegram.handlers  # noqa: F401
 
     await tg_app.start()
+
+    # Verify bot identity
+    me = await tg_app.get_me()
+    log.info("Bot authenticated as @%s (id=%s)", me.username, me.id)
+
+    # Delete any existing webhook that might intercept updates
+    try:
+        from urllib.request import urlopen
+        token = tg_app.bot_token
+        with urlopen(f"https://api.telegram.org/bot{token}/deleteWebhook") as resp:
+            log.info("deleteWebhook result: %s", resp.read().decode())
+    except Exception as e:
+        log.warning("Could not delete webhook: %s", e)
+
     log.info("Telegram bot started, waiting for messages...")
 
     # Keep alive until cancelled — Pyrogram needs the event loop running
