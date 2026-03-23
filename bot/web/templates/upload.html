@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            max-width: 600px;
+            width: 90%;
+            padding: 40px;
+            background: #1a1a2e;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        h1 { text-align: center; margin-bottom: 8px; font-size: 24px; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 32px; font-size: 14px; }
+        .drop-zone {
+            border: 2px dashed #444;
+            border-radius: 12px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 24px;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: #5865f2;
+            background: rgba(88, 101, 242, 0.1);
+        }
+        .drop-zone p { font-size: 16px; color: #aaa; }
+        .drop-zone .icon { font-size: 48px; margin-bottom: 12px; }
+        input[type="file"] { display: none; }
+        .file-info {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            display: none;
+        }
+        .file-info .name { font-weight: 600; word-break: break-all; }
+        .file-info .size { color: #888; font-size: 13px; margin-top: 4px; }
+        .progress-container {
+            display: none;
+            margin-bottom: 16px;
+        }
+        .progress-bar {
+            height: 8px;
+            background: #2a2a4a;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-bar .fill {
+            height: 100%;
+            background: linear-gradient(90deg, #5865f2, #7289da);
+            width: 0%;
+            transition: width 0.3s;
+            border-radius: 4px;
+        }
+        .progress-text {
+            text-align: center;
+            margin-top: 8px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 14px;
+            background: #5865f2;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: #4752c4; }
+        .btn:disabled { background: #333; cursor: not-allowed; }
+        .status {
+            text-align: center;
+            margin-top: 16px;
+            font-size: 14px;
+            display: none;
+        }
+        .status.success { color: #57f287; }
+        .status.error { color: #ed4245; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📁 File Upload</h1>
+        <p class="subtitle">No size limits — upload files of any size</p>
+
+        <div class="drop-zone" id="dropZone">
+            <div class="icon">📤</div>
+            <p>Drag & drop a file here, or click to browse</p>
+        </div>
+        <input type="file" id="fileInput">
+
+        <div class="file-info" id="fileInfo">
+            <div class="name" id="fileName"></div>
+            <div class="size" id="fileSize"></div>
+        </div>
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-bar"><div class="fill" id="progressFill"></div></div>
+            <div class="progress-text" id="progressText">0%</div>
+        </div>
+
+        <button class="btn" id="uploadBtn" disabled>Upload</button>
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        const token = "{{ token }}";
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB chunks
+
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressFill = document.getElementById('progressFill');
+        const progressText = document.getElementById('progressText');
+        const status = document.getElementById('status');
+
+        let selectedFile = null;
+
+        // Drag & drop
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', () => { if (fileInput.files.length) selectFile(fileInput.files[0]); });
+
+        function selectFile(file) {
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSize.textContent = humanSize(file.size);
+            fileInfo.style.display = 'block';
+            uploadBtn.disabled = false;
+        }
+
+        uploadBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            uploadBtn.disabled = true;
+            progressContainer.style.display = 'block';
+            status.style.display = 'none';
+
+            try {
+                if (selectedFile.size <= CHUNK_SIZE * 2) {
+                    // Small file: single upload
+                    await uploadSingle(selectedFile);
+                } else {
+                    // Large file: chunked resumable upload
+                    await uploadChunked(selectedFile);
+                }
+                showStatus('✅ Upload complete! Check Telegram for confirmation.', 'success');
+            } catch (err) {
+                showStatus('❌ Upload failed: ' + err.message, 'error');
+                uploadBtn.disabled = false;
+            }
+        });
+
+        async function uploadSingle(file) {
+            const form = new FormData();
+            form.append('file', file);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `/api/upload/${token}`);
+
+            return new Promise((resolve, reject) => {
+                xhr.upload.onprogress = e => {
+                    if (e.lengthComputable) updateProgress(e.loaded, e.total);
+                };
+                xhr.onload = () => {
+                    if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+                    else reject(new Error(`Server error ${xhr.status}`));
+                };
+                xhr.onerror = () => reject(new Error('Network error'));
+                xhr.send(form);
+            });
+        }
+
+        async function uploadChunked(file) {
+            // 1. Init session
+            const initResp = await fetch(`/api/upload/${token}/init`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, totalSize: file.size }),
+            });
+            if (!initResp.ok) throw new Error('Failed to init upload');
+            const { sessionId } = await initResp.json();
+
+            // 2. Send chunks
+            let offset = 0;
+            while (offset < file.size) {
+                const end = Math.min(offset + CHUNK_SIZE, file.size);
+                const chunk = file.slice(offset, end);
+
+                const resp = await fetch(`/api/upload/${token}/chunk/${sessionId}`, {
+                    method: 'POST',
+                    body: chunk,
+                });
+                if (!resp.ok) throw new Error(`Chunk upload failed at offset ${offset}`);
+
+                offset = end;
+                updateProgress(offset, file.size);
+            }
+
+            // 3. Complete
+            const completeResp = await fetch(`/api/upload/${token}/complete/${sessionId}`, {
+                method: 'POST',
+            });
+            if (!completeResp.ok) throw new Error('Failed to finalize upload');
+            return completeResp.json();
+        }
+
+        function updateProgress(loaded, total) {
+            const pct = Math.round(loaded * 100 / total);
+            progressFill.style.width = pct + '%';
+            progressText.textContent = `${pct}% — ${humanSize(loaded)} / ${humanSize(total)}`;
+        }
+
+        function showStatus(msg, cls) {
+            status.textContent = msg;
+            status.className = 'status ' + cls;
+            status.style.display = 'block';
+        }
+
+        function humanSize(bytes) {
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let i = 0;
+            while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+            return bytes.toFixed(1) + ' ' + units[i];
+        }
+    </script>
+</body>
+</html>
