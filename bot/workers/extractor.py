@@ -192,6 +192,21 @@ async def extract_keywords_batch(
             if not file_record:
                 continue
 
+            # Wait for downloader job to finish and file path to become available.
+            wait_attempts = 0
+            while file_record and (not file_record.local_path) and wait_attempts < 120:
+                wait_attempts += 1
+                await asyncio.sleep(2)
+                file_record = await crud.get_file(file_id)
+                await _set_progress(
+                    f"⏳ Waiting for file downloads\n"
+                    f"Progress: {int((file_idx - 1) / max(1, len(file_ids)) * 80)}%\n"
+                    f"File {file_idx}/{len(file_ids)} not ready yet..."
+                )
+
+            if not file_record:
+                continue
+
             filepath = Path(file_record.local_path) if file_record.local_path else None
 
             # Restore from bucket if local copy is missing.

@@ -499,68 +499,72 @@ async def cmd_cancel(_, message: Message):
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel"]))
 async def on_guided_keywords(_, message: Message):
-    user_id = message.from_user.id
-    session = guided_sessions.get(user_id)
-    if not session or session.state != "waiting_keywords":
-        return
+    try:
+        user_id = message.from_user.id
+        session = guided_sessions.get(user_id)
+        if not session or session.state != "waiting_keywords":
+            return
 
-    lines = [line.strip() for line in (message.text or "").splitlines()]
-    keywords: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
-        if not line:
-            continue
-        norm = line.lower()
-        if norm in seen:
-            continue
-        seen.add(norm)
-        keywords.append(line)
+        lines = [line.strip() for line in (message.text or "").splitlines()]
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            if not line:
+                continue
+            norm = line.lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            keywords.append(line)
 
-    if not keywords:
-        await message.reply("❌ No valid keywords found. Send one keyword/domain per line.")
-        return
+        if not keywords:
+            await message.reply("❌ No valid keywords found. Send one keyword/domain per line.")
+            return
 
-    if len(keywords) > MAX_GUIDED_KEYWORDS:
-        await message.reply(f"❌ Too many keywords. Max is {MAX_GUIDED_KEYWORDS}.")
-        return
+        if len(keywords) > MAX_GUIDED_KEYWORDS:
+            await message.reply(f"❌ Too many keywords. Max is {MAX_GUIDED_KEYWORDS}.")
+            return
 
-    if not session.file_ids:
-        await message.reply("❌ No files collected. Use /start and send files first.")
-        session.state = "idle"
-        return
+        if not session.file_ids:
+            await message.reply("❌ No files collected. Use /start and send files first.")
+            session.state = "idle"
+            return
 
-    session.state = "processing"
-    mode = session.mode or "ulp"
-    mode_label = mode.upper()
+        session.state = "processing"
+        mode = session.mode or "ulp"
+        mode_label = mode.upper()
 
-    primary_file_id = session.file_ids[0] if session.file_ids else None
-    job_type = JobType.ULP_EXTRACT if mode == "ulp" else JobType.LOGS_EXTRACT
-    job = await crud.create_job(
-        user_id=user_id,
-        job_type=job_type,
-        file_id=primary_file_id,
-    )
+        primary_file_id = session.file_ids[0] if session.file_ids else None
+        # Use existing enum value to avoid runtime failure when DB enum schema wasn't migrated.
+        job = await crud.create_job(
+            user_id=user_id,
+            job_type=JobType.SEARCH,
+            file_id=primary_file_id,
+        )
 
-    status_msg = await message.reply(
-        f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
-        "Progress: 0%"
-    )
+        status_msg = await message.reply(
+            f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
+            "Progress: 0%"
+        )
 
-    from bot.workers._arq import enqueue
+        from bot.workers._arq import enqueue
 
-    await enqueue(
-        "extract_keywords_batch",
-        user_id=user_id,
-        file_ids=session.file_ids,
-        keywords=keywords,
-        job_id=str(job.id),
-        chat_id=message.chat.id,
-        status_message_id=status_msg.id,
-        mode=mode,
-    )
+        await enqueue(
+            "extract_keywords_batch",
+            user_id=user_id,
+            file_ids=session.file_ids,
+            keywords=keywords,
+            job_id=str(job.id),
+            chat_id=message.chat.id,
+            status_message_id=status_msg.id,
+            mode=mode,
+        )
 
-    # Reset for next /start flow.
-    guided_sessions[user_id] = GuidedSession()
+        # Reset for next /start flow.
+        guided_sessions[user_id] = GuidedSession()
+    except Exception as e:
+        log.exception("Guided keyword submission failed: %s", e)
+        await message.reply(f"❌ Failed to start extraction: `{e}`")
 
 
 # ── Helper ───────────────────────────────────────────────────────────
