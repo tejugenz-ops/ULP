@@ -44,18 +44,31 @@ async def run_web_server():
     await server.serve()
 
 
+async def run_telegram():
+    """Start Pyrogram and keep it alive."""
+    # Import handlers to register them with the Pyrogram client
+    import bot.telegram.handlers  # noqa: F401
+
+    await tg_app.start()
+    log.info("Telegram bot started, waiting for messages...")
+
+    # Keep alive until cancelled — Pyrogram needs the event loop running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await tg_app.stop()
+
+
 async def main():
     log.info("Initializing database...")
     await init_db()
 
     log.info("Starting services...")
 
-    # Import handlers to register them with the Pyrogram client
-    import bot.telegram.handlers  # noqa: F401
-
     # Start all three services concurrently
     await asyncio.gather(
-        tg_app.start(),        # Pyrogram bot (MTProto)
+        run_telegram(),        # Pyrogram bot (MTProto)
         run_web_server(),      # FastAPI (HTTP)
         run_arq_worker(),      # ARQ job worker
     )

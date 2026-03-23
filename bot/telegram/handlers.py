@@ -405,3 +405,16 @@ def _human(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024  # type: ignore
     return f"{n:.1f} PB"
+
+
+# ── Debug: catch-all handler to confirm updates are arriving ─────────
+
+
+@app.on_message(group=99)
+async def _debug_log(_, message: Message):
+    log.info(
+        "DEBUG incoming message: chat=%s user=%s text=%r",
+        message.chat.id,
+        getattr(message.from_user, "id", None),
+        (message.text or "")[:80],
+    )
