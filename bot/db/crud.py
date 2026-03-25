@@ -95,6 +95,16 @@ async def list_user_files(user_id: int) -> list[File]:
         return list(result.scalars().all())
 
 
+async def list_all_ready_files() -> list[File]:
+    async with _session() as s:
+        result = await s.execute(
+            select(File)
+            .where(File.status == FileStatus.READY)
+            .order_by(File.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+
 async def delete_file(file_id: _ID) -> None:
     fid = _uuid(file_id)
     async with _session() as s:

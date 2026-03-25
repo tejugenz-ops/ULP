@@ -38,8 +38,8 @@ guided_sessions: dict[int, GuidedSession] = {}
 # flooding the chat with one message per file.
 _file_button_msg: dict[int, int] = {}  # user_id → message_id
 
-MAX_GUIDED_FILES = 999
-MAX_GUIDED_KEYWORDS = 200
+MAX_GUIDED_FILES = 999999
+MAX_GUIDED_KEYWORDS = 999999
 
 
 def _authorized(user_id: int) -> bool:
@@ -467,9 +467,9 @@ async def cmd_scan(_, message: Message):
         message.from_user.first_name,
     )
 
-    files = await crud.list_user_files(message.from_user.id)
+    files = await crud.list_all_ready_files()
     if not files:
-        return await message.reply("📂 No files stored. Send files first or use /start.")
+        return await message.reply("📂 No files in database. Upload files first or use /start.")
 
     total_bytes = sum(f.size_bytes or 0 for f in files)
     total_gb = total_bytes / (1024 ** 3)
@@ -482,7 +482,7 @@ async def cmd_scan(_, message: Message):
     guided_sessions[message.from_user.id] = session
 
     await message.reply(
-        f"📊 **{len(files)} files** stored — **{total_gb:.2f} GB** total.\n\n"
+        f"📊 **{len(files)} files** in database — **{total_gb:.2f} GB** total.\n\n"
         "Send keywords to scan (one per line):"
     )
 

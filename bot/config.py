@@ -50,3 +50,6 @@ ALLOWED_USERS: set[int] = (
 
 # --- ARQ workers ---
 ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "20"))
+
+# --- Scan workers (parallel ripgrep processes) ---
+SCAN_WORKERS: int = int(os.environ.get("SCAN_WORKERS", "8"))

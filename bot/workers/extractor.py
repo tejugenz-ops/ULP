@@ -7,13 +7,13 @@ import re
 import subprocess
 from pathlib import Path
 
-from bot.config import PROCESSING_DIR
+from bot.config import PROCESSING_DIR, SCAN_WORKERS
 from bot.db import crud
 from bot.db.models import FileStatus, JobStatus
 
 log = logging.getLogger(__name__)
 
-MAX_RESULTS = 500
+MAX_RESULTS = 100000
 MAX_MESSAGE_LEN = 4000  # Telegram message limit ~4096
 
 
@@ -346,48 +346,61 @@ async def extract_keywords_batch(
         try:
             kw_tmp.write_text("\n".join(deduped_keywords) + "\n", encoding="utf-8")
 
+            sem = asyncio.Semaphore(SCAN_WORKERS)
             scanned_bytes = 0
-            for file_idx, (fid, filepath, fsize) in enumerate(scan_files, start=1):
-                pct = int((scanned_bytes / max(1, total_scan_bytes)) * 100)
-                kw_summary = " | ".join(
-                    f"{kw}: {len(keyword_creds[kw])}" for kw in deduped_keywords
-                )
-                await _set_progress(
-                    f"🔎 **Scanning**\n"
-                    f"{_bar(pct)} {pct}%\n"
-                    f"Scanned: {_human_bytes(scanned_bytes)} / {_human_bytes(total_scan_bytes)}\n"
-                    f"File {file_idx}/{len(scan_files)}: {filepath.name}\n"
-                    f"{kw_summary}"
-                )
+            lock = asyncio.Lock()
 
-                # Run ripgrep: case-insensitive, patterns from file, no heading
-                rg_result = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "rg", "-i",
-                        "--no-heading",
-                        "--no-line-number",
-                        "--no-messages",
-                        "-f", str(kw_tmp),
-                        str(filepath),
-                    ],
-                    capture_output=True,
-                )
+            async def _scan_one(file_idx: int, fid: str, filepath: Path, fsize: int):
+                nonlocal scanned_bytes
+                async with sem:
+                    rg_result = await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "rg", "-i",
+                            "--no-heading",
+                            "--no-line-number",
+                            "--no-messages",
+                            "-f", str(kw_tmp),
+                            str(filepath),
+                        ],
+                        capture_output=True,
+                    )
 
-                # Categorize each matched line into keywords and extract credentials
-                for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        continue
-                    line_lower = stripped.lower()
-                    cred = _extract_credential(stripped)
-                    if not cred:
-                        continue
-                    for kw in deduped_keywords:
-                        if kw.lower() in line_lower:
-                            keyword_creds[kw].add(cred)
+                    local_hits: dict[str, set[str]] = {kw: set() for kw in deduped_keywords}
+                    for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
+                        stripped = raw_line.strip()
+                        if not stripped:
+                            continue
+                        line_lower = stripped.lower()
+                        cred = _extract_credential(stripped)
+                        if not cred:
+                            continue
+                        for kw in deduped_keywords:
+                            if kw.lower() in line_lower:
+                                local_hits[kw].add(cred)
 
-                scanned_bytes += fsize
+                    async with lock:
+                        for kw in deduped_keywords:
+                            keyword_creds[kw].update(local_hits[kw])
+                        scanned_bytes += fsize
+
+                        pct = int((scanned_bytes / max(1, total_scan_bytes)) * 100)
+                        kw_summary = " | ".join(
+                            f"{kw}: {len(keyword_creds[kw])}" for kw in deduped_keywords
+                        )
+                        await _set_progress(
+                            f"🔎 **Scanning**\n"
+                            f"{_bar(pct)} {pct}%\n"
+                            f"Scanned: {_human_bytes(scanned_bytes)} / {_human_bytes(total_scan_bytes)}\n"
+                            f"Files: {len(scan_files)} | Workers: {SCAN_WORKERS}\n"
+                            f"{kw_summary}"
+                        )
+
+            tasks = [
+                _scan_one(idx, fid, fp, sz)
+                for idx, (fid, fp, sz) in enumerate(scan_files, start=1)
+            ]
+            await asyncio.gather(*tasks)
 
             # Final scan progress
             kw_summary = " | ".join(
