@@ -6,11 +6,22 @@ import logging
 import re
 from pathlib import Path
 
+from bot.config import TG_DOWNLOAD_WORKERS
 from bot.db import crud
 from bot.db.models import FileStatus, JobStatus
 from bot.storage import bucket, local
 
 log = logging.getLogger(__name__)
+
+# Limit concurrent Telegram downloads to avoid flooding Telegram's media DC
+_tg_download_sem: asyncio.Semaphore | None = None
+
+
+def _get_tg_sem() -> asyncio.Semaphore:
+    global _tg_download_sem
+    if _tg_download_sem is None:
+        _tg_download_sem = asyncio.Semaphore(TG_DOWNLOAD_WORKERS)
+    return _tg_download_sem
 
 
 async def download_telegram_file(
@@ -36,16 +47,18 @@ async def download_telegram_file(
     await crud.update_file(file_id, status=FileStatus.DOWNLOADING)
 
     try:
-        tracker = None
-        if not silent and status_message_id:
-            msg = await tg.get_messages(chat_id, status_message_id)
-            tracker = ProgressTracker(msg, action="⬇️ Downloading from Telegram")
+        sem = _get_tg_sem()
+        async with sem:
+            tracker = None
+            if not silent and status_message_id:
+                msg = await tg.get_messages(chat_id, status_message_id)
+                tracker = ProgressTracker(msg, action="⬇️ Downloading from Telegram")
 
-        await tg.download_media(
-            telegram_file_id,
-            file_name=str(dest),
-            progress=tracker,
-        )
+            await tg.download_media(
+                telegram_file_id,
+                file_name=str(dest),
+                progress=tracker,
+            )
 
         size = await local.get_file_size(dest)
 
