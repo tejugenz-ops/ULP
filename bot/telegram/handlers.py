@@ -487,7 +487,7 @@ async def cmd_scan(_, message: Message):
     )
 
 
-# ── /status — Active jobs ────────────────────────────────────────────
+# ── /status — Dashboard ──────────────────────────────────────────────
 
 
 @app.on_message(filters.command("status") & filters.private)
@@ -495,15 +495,26 @@ async def cmd_status(_, message: Message):
     if not _authorized(message.from_user.id):
         return await message.reply("⛔ You are not authorized.")
 
-    jobs = await crud.list_active_jobs(message.from_user.id)
-    if not jobs:
-        return await message.reply("✅ No active jobs.")
+    stats = await crud.get_db_stats()
+    jobs = await crud.list_all_active_jobs()
 
-    lines = ["⚙️ **Active Jobs:**\n"]
-    for j in jobs:
-        emoji = "🔄" if j.status == JobStatus.RUNNING else "⏳"
-        pct = f" ({j.progress}%)" if j.progress else ""
-        lines.append(f"{emoji} `{j.id}` — {j.job_type.value}{pct}")
+    lines = [
+        "📊 **Bot Status**\n",
+        f"📁 **Total files in DB:** {stats['total_files']}",
+        f"✅ **Ready:** {stats['ready_count']}  ({_human(stats['ready_bytes'])})",
+        f"⬇️ **Downloading:** {stats['downloading']}",
+    ]
+
+    # Active jobs breakdown
+    running = [j for j in jobs if j.status == JobStatus.RUNNING]
+    queued = [j for j in jobs if j.status == JobStatus.QUEUED]
+    lines.append(f"\n⚙️ **Active jobs:** {len(running)} running, {len(queued)} queued")
+
+    if running:
+        lines.append("")
+        for j in running:
+            pct = f" — {j.progress}%" if j.progress else ""
+            lines.append(f"🔄 `{j.job_type.value}`{pct}")
 
     await message.reply("\n".join(lines))
 

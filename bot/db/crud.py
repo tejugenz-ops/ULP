@@ -1,7 +1,7 @@
 import uuid
 from typing import Union
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import (
@@ -159,3 +159,39 @@ async def list_active_jobs(user_id: int) -> list[Job]:
 async def count_active_jobs(user_id: int) -> int:
     jobs = await list_active_jobs(user_id)
     return len(jobs)
+
+
+async def get_db_stats() -> dict:
+    """Return total files, total size, and counts per status."""
+    async with _session() as s:
+        # Total ready files + size
+        row = (await s.execute(
+            select(func.count(), func.coalesce(func.sum(File.size_bytes), 0))
+            .where(File.status == FileStatus.READY)
+        )).one()
+        ready_count, ready_bytes = int(row[0]), int(row[1])
+
+        # Downloading files
+        dl_count = (await s.execute(
+            select(func.count()).where(File.status == FileStatus.DOWNLOADING)
+        )).scalar() or 0
+
+        # All files total
+        total = (await s.execute(select(func.count()).select_from(File))).scalar() or 0
+
+        return {
+            "total_files": total,
+            "ready_count": ready_count,
+            "ready_bytes": ready_bytes,
+            "downloading": dl_count,
+        }
+
+
+async def list_all_active_jobs() -> list[Job]:
+    async with _session() as s:
+        result = await s.execute(
+            select(Job)
+            .where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+            .order_by(Job.created_at.desc())
+        )
+        return list(result.scalars().all())
