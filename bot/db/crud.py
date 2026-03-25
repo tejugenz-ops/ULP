@@ -195,3 +195,44 @@ async def list_all_active_jobs() -> list[Job]:
             .order_by(Job.created_at.desc())
         )
         return list(result.scalars().all())
+
+
+async def cancel_user_jobs(user_id: int) -> int:
+    """Cancel all active jobs for a user. Returns count."""
+    async with _session() as s:
+        result = await s.execute(
+            update(Job)
+            .where(
+                Job.user_id == user_id,
+                Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+            )
+            .values(status=JobStatus.CANCELLED)
+        )
+        # Also reset any downloading files for this user
+        await s.execute(
+            update(File)
+            .where(
+                File.user_id == user_id,
+                File.status.in_([FileStatus.DOWNLOADING, FileStatus.PROCESSING]),
+            )
+            .values(status=FileStatus.ERROR, error_message="Stopped by user")
+        )
+        await s.commit()
+        return result.rowcount
+
+
+async def cancel_all_jobs() -> int:
+    """Cancel ALL active jobs across all users. Returns count."""
+    async with _session() as s:
+        result = await s.execute(
+            update(Job)
+            .where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+            .values(status=JobStatus.CANCELLED)
+        )
+        await s.execute(
+            update(File)
+            .where(File.status.in_([FileStatus.DOWNLOADING, FileStatus.PROCESSING]))
+            .values(status=FileStatus.ERROR, error_message="Stopped by admin")
+        )
+        await s.commit()
+        return result.rowcount

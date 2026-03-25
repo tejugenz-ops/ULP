@@ -544,7 +544,36 @@ async def cmd_cancel(_, message: Message):
     await message.reply(f"🛑 Job `{jid}` cancelled.")
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan"]))
+# ── /stop — Stop own jobs  |  /stop all — Stop everything ────────────
+
+
+@app.on_message(filters.command("stop") & filters.private)
+async def cmd_stop(_, message: Message):
+    if not _authorized(message.from_user.id):
+        return await message.reply("⛔ You are not authorized.")
+
+    from bot.workers._arq import abort_all_queued
+
+    args = message.text.split(maxsplit=1)
+    stop_all = len(args) > 1 and args[1].strip().lower() == "all"
+
+    if stop_all:
+        cancelled = await crud.cancel_all_jobs()
+        q_removed = await abort_all_queued()
+        await message.reply(
+            f"🛑 **Stopped everything.**\n"
+            f"Jobs cancelled: {cancelled}\n"
+            f"Queued tasks flushed: {q_removed}"
+        )
+    else:
+        cancelled = await crud.cancel_user_jobs(message.from_user.id)
+        await message.reply(
+            f"🛑 **Stopped all your jobs.**\n"
+            f"Jobs cancelled: {cancelled}"
+        )
+
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop"]))
 async def on_guided_keywords(_, message: Message):
     try:
         user_id = message.from_user.id

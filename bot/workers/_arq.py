@@ -33,6 +33,20 @@ async def enqueue(func_name: str, **kwargs) -> None:
     await pool.enqueue_job(func_name, **kwargs)
 
 
+async def abort_all_queued() -> int:
+    """Delete all queued ARQ jobs from Redis. Returns count removed."""
+    pool = await get_pool()
+    all_jobs = await pool.queued_jobs()
+    count = 0
+    for job_info in all_jobs:
+        try:
+            await pool.delete(job_info.job_id)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        count += 1
+    return count
+
+
 # ── Worker class (used by ARQ worker process) ────────────────────────
 
 from bot.workers.downloader import download_telegram_file, download_url
