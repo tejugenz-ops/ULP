@@ -72,6 +72,9 @@ class File(Base):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id"), nullable=False
     )
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(
+        String(255), index=True
+    )
     original_name: Mapped[str] = mapped_column(String(1024))
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     mime_type: Mapped[str | None] = mapped_column(String(255))
@@ -134,3 +137,16 @@ async_session = async_sessionmaker(engine, expire_on_commit=False)
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # migrate: add telegram_file_unique_id if missing
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE files ADD COLUMN IF NOT EXISTS"
+                " telegram_file_unique_id VARCHAR(255)"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "CREATE INDEX IF NOT EXISTS ix_files_tg_unique_id"
+                " ON files (telegram_file_unique_id)"
+            )
+        )

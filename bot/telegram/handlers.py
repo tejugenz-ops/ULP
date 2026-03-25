@@ -230,11 +230,28 @@ async def on_document(_, message: Message):
         message.from_user.first_name,
     )
 
+    # ── Duplicate detection ──
+    unique_id = getattr(doc, "file_unique_id", None)
+    if unique_id:
+        existing = await crud.find_file_by_unique_id(unique_id)
+        if existing:
+            status_label = "already downloaded" if existing.status.value == "ready" else "already downloading"
+            await message.reply(
+                f"♻️ **Duplicate skipped** — `{existing.original_name}` is {status_label}."
+            )
+            # Still track in guided session so user doesn't re-send
+            session = guided_sessions.get(message.from_user.id)
+            if session and session.state in {"waiting_files", "waiting_confirm"}:
+                session.file_ids.append(str(existing.id))
+                session.state = "waiting_confirm"
+            return
+
     file_record = await crud.create_file(
         user_id=message.from_user.id,
         original_name=original_name,
         size_bytes=doc.file_size,
         mime_type=doc.mime_type,
+        telegram_file_unique_id=unique_id,
     )
     job = await crud.create_job(
         user_id=message.from_user.id,

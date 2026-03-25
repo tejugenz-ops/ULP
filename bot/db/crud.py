@@ -49,12 +49,27 @@ async def get_or_create_user(
 # ── File ─────────────────────────────────────────────────────────────
 
 
+async def find_file_by_unique_id(unique_id: str) -> File | None:
+    """Return an existing READY or DOWNLOADING file with this Telegram unique ID."""
+    async with _session() as s:
+        row = await s.execute(
+            select(File)
+            .where(
+                File.telegram_file_unique_id == unique_id,
+                File.status.in_([FileStatus.READY, FileStatus.DOWNLOADING]),
+            )
+            .limit(1)
+        )
+        return row.scalars().first()
+
+
 async def create_file(
     user_id: int,
     original_name: str,
     size_bytes: int | None = None,
     mime_type: str | None = None,
     parent_id: uuid.UUID | None = None,
+    telegram_file_unique_id: str | None = None,
 ) -> File:
     async with _session() as s:
         f = File(
@@ -63,6 +78,7 @@ async def create_file(
             size_bytes=size_bytes,
             mime_type=mime_type,
             parent_id=parent_id,
+            telegram_file_unique_id=telegram_file_unique_id,
         )
         s.add(f)
         await s.commit()
