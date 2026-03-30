@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from pyrogram import filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.config import ALLOWED_USERS
@@ -199,7 +200,12 @@ async def cmd_download(_, message: Message):
         file_id=file_record.id,
     )
 
-    status_msg = await message.reply("⬇️ **Starting URL download...**")
+    try:
+        status_msg = await message.reply("⬇️ **Starting URL download...")
+        status_message_id = status_msg.id
+    except FloodWait as e:
+        log.warning("FloodWait %ss on URL download reply, proceeding silently", e.value)
+        status_message_id = 0
 
     # Enqueue download job via ARQ
     from bot.workers._arq import enqueue
@@ -212,7 +218,7 @@ async def cmd_download(_, message: Message):
         original_name=original_name,
         job_id=str(job.id),
         chat_id=message.chat.id,
-        status_message_id=status_msg.id,
+        status_message_id=status_message_id,
     )
 
 
@@ -310,7 +316,12 @@ async def on_document(_, message: Message):
             _file_button_msg[message.from_user.id] = sent.id
     else:
         # Non-guided: full progress + completion message
-        status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
+        try:
+            status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
+            status_message_id = status_msg.id
+        except FloodWait as e:
+            log.warning("FloodWait %ss on download reply, proceeding silently", e.value)
+            status_message_id = 0
         await enqueue(
             "download_telegram_file",
             user_id=message.from_user.id,
@@ -319,7 +330,7 @@ async def on_document(_, message: Message):
             original_name=original_name,
             job_id=str(job.id),
             chat_id=message.chat.id,
-            status_message_id=status_msg.id,
+            status_message_id=status_message_id,
         )
 
 
@@ -376,7 +387,12 @@ async def cmd_search(_, message: Message):
         file_id=uuid.UUID(file_id),
     )
 
-    status_msg = await message.reply(f"🔍 Searching for `{pattern}`...\nProgress: 0%")
+    try:
+        status_msg = await message.reply(f"🔍 Searching for `{pattern}`...\nProgress: 0%")
+        status_message_id = status_msg.id
+    except FloodWait as e:
+        log.warning("FloodWait %ss on search reply, proceeding silently", e.value)
+        status_message_id = 0
 
     from bot.workers._arq import enqueue
 
@@ -387,7 +403,7 @@ async def cmd_search(_, message: Message):
         pattern=pattern,
         job_id=str(job.id),
         chat_id=message.chat.id,
-        status_message_id=status_msg.id,
+        status_message_id=status_message_id,
     )
 
 
@@ -727,10 +743,15 @@ async def on_guided_keywords(_, message: Message):
             file_id=primary_file_id,
         )
 
-        status_msg = await message.reply(
-            f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
-            "Progress: 0%"
-        )
+        try:
+            status_msg = await message.reply(
+                f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
+                "Progress: 0%"
+            )
+            status_message_id = status_msg.id
+        except FloodWait as e:
+            log.warning("FloodWait %ss on extraction reply, proceeding silently", e.value)
+            status_message_id = 0
 
         from bot.workers._arq import enqueue
 
@@ -741,7 +762,7 @@ async def on_guided_keywords(_, message: Message):
             keywords=keywords,
             job_id=str(job.id),
             chat_id=message.chat.id,
-            status_message_id=status_msg.id,
+            status_message_id=status_message_id,
             mode=mode,
         )
 
