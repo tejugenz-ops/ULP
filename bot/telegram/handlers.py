@@ -34,6 +34,9 @@ class GuidedSession:
 
 guided_sessions: dict[int, GuidedSession] = {}
 
+# Pending archive password input: user_id → file_id (latest archive awaiting password)
+pending_archive_pw: dict[int, str] = {}
+
 # Track the "files added" button message per user so we can edit it instead of
 # flooding the chat with one message per file.
 _file_button_msg: dict[int, int] = {}  # user_id → message_id
@@ -590,10 +593,97 @@ async def cmd_stop(_, message: Message):
         )
 
 
+@app.on_callback_query(filters.regex(r"^archcancel:"))
+async def on_archive_cancel(_, callback: CallbackQuery):
+    """Cancel a password-protected archive and delete it."""
+    user_id = callback.from_user.id
+    if not _authorized(user_id):
+        return await callback.answer("Not authorized", show_alert=True)
+
+    file_id = callback.data.split(":", 1)[1]
+
+    from bot.workers.decompressor import pending_passwords
+
+    info = pending_passwords.pop(file_id, None)
+    pending_archive_pw.pop(user_id, None)
+
+    # Delete the archive file
+    file_record = await crud.get_file(uuid.UUID(file_id))
+    if file_record:
+        if file_record.local_path:
+            p = Path(file_record.local_path)
+            if p.exists():
+                p.unlink()
+            parent = p.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        if file_record.bucket_key:
+            from bot.storage import bucket
+            try:
+                await bucket.delete_object(file_record.bucket_key)
+            except Exception:
+                pass
+        await crud.delete_file(uuid.UUID(file_id))
+
+    # Cancel the job if tracked
+    if info:
+        try:
+            await crud.update_job(info["job_id"], status=JobStatus.CANCELLED)
+        except Exception:
+            pass
+
+    await callback.message.edit_text(
+        f"🗑️ Archive `{file_record.original_name if file_record else file_id}` cancelled and deleted."
+    )
+    await callback.answer()
+
+
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop"]))
 async def on_guided_keywords(_, message: Message):
     try:
         user_id = message.from_user.id
+
+        # Check if user is providing an archive password
+        pw_file_id = pending_archive_pw.get(user_id)
+        if not pw_file_id:
+            # Also check decompressor pending_passwords to auto-detect
+            from bot.workers.decompressor import pending_passwords
+            for fid, info in pending_passwords.items():
+                if info.get("user_id") == user_id:
+                    pw_file_id = fid
+                    break
+
+        if pw_file_id:
+            password = (message.text or "").strip()
+            if not password:
+                return
+
+            from bot.workers.decompressor import pending_passwords
+            info = pending_passwords.pop(pw_file_id, None)
+            pending_archive_pw.pop(user_id, None)
+
+            if not info:
+                return
+
+            # Delete the user's password message for privacy
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            await message.reply(f"🔑 Retrying extraction with password...")
+
+            from bot.workers._arq import enqueue
+            await enqueue(
+                "extract_archive",
+                user_id=info["user_id"],
+                file_id=pw_file_id,
+                password=password,
+                job_id=info["job_id"],
+                chat_id=info["chat_id"],
+            )
+            return
+
         session = guided_sessions.get(user_id)
         if not session or session.state != "waiting_keywords":
             return

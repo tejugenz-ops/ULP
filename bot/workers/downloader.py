@@ -8,10 +8,46 @@ from pathlib import Path
 
 from bot.config import TG_DOWNLOAD_WORKERS
 from bot.db import crud
-from bot.db.models import FileStatus, JobStatus
+from bot.db.models import FileStatus, JobStatus, JobType
 from bot.storage import bucket, local
 
 log = logging.getLogger(__name__)
+
+# Archive extensions that should be auto-extracted after download
+ARCHIVE_EXTENSIONS = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+    ".cab", ".iso", ".lzma", ".lz",
+}
+
+
+def _is_archive(name: str) -> bool:
+    """Check if filename looks like an archive."""
+    low = name.lower()
+    # Check double extensions first (e.g. .tar.gz)
+    for ext in ARCHIVE_EXTENSIONS:
+        if low.endswith(ext):
+            return True
+    return False
+
+
+async def _auto_extract(user_id: int, file_id: str, chat_id: int) -> None:
+    """Enqueue an extract_archive job for the file."""
+    from bot.workers._arq import enqueue
+
+    job = await crud.create_job(
+        user_id=user_id,
+        job_type=JobType.EXTRACT,
+        file_id=file_id,
+    )
+    await enqueue(
+        "extract_archive",
+        user_id=user_id,
+        file_id=file_id,
+        password=None,
+        job_id=str(job.id),
+        chat_id=chat_id,
+    )
 
 # Limit concurrent Telegram downloads to avoid flooding Telegram's media DC
 _tg_download_sem: asyncio.Semaphore | None = None
@@ -81,7 +117,10 @@ async def download_telegram_file(
                 log.warning("Background bucket upload failed for %s: %s", file_id, exc)
         asyncio.create_task(_bg_upload())
 
-        if not silent:
+        # Auto-extract if archive
+        if _is_archive(original_name):
+            asyncio.create_task(_auto_extract(user_id, file_id, chat_id))
+        elif not silent:
             async def _notify():
                 try:
                     await tg.send_message(
@@ -202,15 +241,19 @@ async def download_url(
                 log.warning("Background bucket upload failed for %s: %s", file_id, exc)
         asyncio.create_task(_bg_upload())
 
-        await tg.send_message(
-            chat_id,
-            f"✅ **URL download complete!**\n"
-            f"📄 `{original_name}`\n"
-            f"📦 Size: {_human(size)}\n"
-            f"🔑 File ID: `{file_id}`\n\n"
-            f"Use `/search {file_id} <pattern>` to search\n"
-            f"Use `/unzip {file_id}` to extract archives",
-        )
+        # Auto-extract if archive
+        if _is_archive(original_name):
+            await _auto_extract(user_id, file_id, chat_id)
+        else:
+            await tg.send_message(
+                chat_id,
+                f"✅ **URL download complete!**\n"
+                f"📄 `{original_name}`\n"
+                f"📦 Size: {_human(size)}\n"
+                f"🔑 File ID: `{file_id}`\n\n"
+                f"Use `/search {file_id} <pattern>` to search\n"
+                f"Use `/unzip {file_id}` to extract archives",
+            )
     except Exception as e:
         log.exception("URL download failed: %s", e)
         await crud.update_file(file_id, status=FileStatus.ERROR, error_message=str(e))
