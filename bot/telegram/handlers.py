@@ -623,6 +623,8 @@ async def on_archive_cancel(_, callback: CallbackQuery):
                 await bucket.delete_object(file_record.bucket_key)
             except Exception:
                 pass
+        await crud.delete_jobs_for_file(uuid.UUID(file_id))
+        await crud.delete_children(uuid.UUID(file_id))
         await crud.delete_file(uuid.UUID(file_id))
 
     # Cancel the job if tracked

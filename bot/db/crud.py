@@ -166,6 +166,18 @@ async def delete_file(file_id: _ID) -> None:
             await s.commit()
 
 
+async def delete_jobs_for_file(file_id: _ID) -> int:
+    """Delete all jobs that reference this file. Returns count deleted."""
+    from sqlalchemy import delete as sa_delete
+    fid = _uuid(file_id)
+    async with _session() as s:
+        result = await s.execute(
+            sa_delete(Job).where(Job.file_id == fid)
+        )
+        await s.commit()
+        return result.rowcount  # type: ignore[return-value]
+
+
 # ── Job ──────────────────────────────────────────────────────────────
 
 

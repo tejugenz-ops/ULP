@@ -89,10 +89,13 @@ async def extract_archive(
         else:
             cmd.append("-p")  # empty password = no password prompt hang
 
-        await tg.send_message(
-            chat_id,
-            f"📦 Extracting `{file_record.original_name}`...",
-        )
+        try:
+            await tg.send_message(
+                chat_id,
+                f"📦 Extracting `{file_record.original_name}`...",
+            )
+        except Exception as msg_err:
+            log.warning("Could not send extraction start message: %s", msg_err)
 
         proc = await asyncio.to_thread(
             subprocess.run,
@@ -190,7 +193,10 @@ async def extract_archive(
                 msg_lines.append(f"... and {len(registered) - 20} more")
 
         msg_lines.append(f"\nUse `/scan` to search all files")
-        await tg.send_message(chat_id, "\n".join(msg_lines))
+        try:
+            await tg.send_message(chat_id, "\n".join(msg_lines))
+        except Exception as msg_err:
+            log.warning("Could not send extraction result: %s", msg_err)
 
     except Exception as e:
         log.exception("Extraction failed: %s", e)
@@ -222,6 +228,7 @@ async def _delete_archive(file_id: str, filepath: Path, bucket_key: str | None) 
             log.warning("Failed to delete archive from bucket: %s", exc)
 
     try:
+        await crud.delete_jobs_for_file(file_id)
         await crud.delete_children(file_id)
         await crud.delete_file(file_id)
     except Exception as exc:

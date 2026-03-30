@@ -13,7 +13,7 @@ class ProgressTracker:
         self.message = message
         self.action = action
         self._last_edit: float = 0
-        self._edit_interval: float = 2.0  # seconds between message edits
+        self._edit_interval: float = 5.0  # seconds between message edits
 
     async def __call__(self, current: int, total: int) -> None:
         """Pyrogram-compatible progress callback."""
