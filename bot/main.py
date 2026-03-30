@@ -4,6 +4,7 @@ Pyrogram runs as the primary async loop owner; FastAPI runs in a thread.
 """
 
 import asyncio
+import glob
 import logging
 import threading
 from pathlib import Path
@@ -79,16 +80,36 @@ async def main():
     web_thread.start()
     log.info("Web server started in background thread on :8080")
 
-    # Start Pyrogram bot FIRST — must be fully connected before ARQ workers
-    # can send messages through the client
-    log.info("Starting Telegram bot...")
+    # ── Flush stale ARQ jobs from Redis ──
+    # Previous deploys may have left queued jobs that would fire immediately
+    # and flood Telegram API calls before the session is stable.
+    try:
+        from bot.workers._arq import get_pool
+        pool = await get_pool()
+        stale_keys = await pool.keys("arq:job:*")
+        if stale_keys:
+            await pool.delete(*stale_keys)
+        queue_len = await pool.zcard(b"arq:queue")
+        if queue_len:
+            await pool.delete(b"arq:queue")
+        log.info("Flushed %d stale ARQ job key(s) and %d queued job(s)",
+                 len(stale_keys), queue_len)
+    except Exception:
+        log.exception("Failed to flush stale ARQ jobs")
 
-    # Delete stale session file to prevent corrupted auth_key / msg_id loops.
-    # Bot tokens re-authenticate instantly so there's nothing valuable to keep.
-    session_path = Path(tg_app.workdir) / f"{tg_app.name}.session"
-    if session_path.exists():
-        session_path.unlink()
-        log.info("Removed stale session file: %s", session_path)
+    # ── Clean Pyrogram session files ──
+    # Delete ALL session-related files (session + SQLite journal/wal/shm)
+    # to prevent corrupted auth_key / msg_id reconnect loops.
+    # Bot tokens re-authenticate instantly so nothing valuable is lost.
+    session_base = str(Path(tg_app.workdir) / tg_app.name) + ".session"
+    for f in glob.glob(session_base + "*"):
+        Path(f).unlink(missing_ok=True)
+        log.info("Removed session file: %s", f)
+
+    # ── Start Pyrogram ──
+    # Brief cooldown — Telegram may rate-limit IPs that had connection storms.
+    log.info("Starting Telegram bot (cooldown 10s)...")
+    await asyncio.sleep(10)
 
     await tg_app.start()
 

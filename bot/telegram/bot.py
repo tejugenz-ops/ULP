@@ -14,7 +14,7 @@ app = Client(
     api_id=TELEGRAM_API_ID,
     api_hash=TELEGRAM_API_HASH,
     bot_token=TELEGRAM_BOT_TOKEN,
-    workers=16,
+    workers=4,
     max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
     workdir="/data",
 )
