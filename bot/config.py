@@ -32,9 +32,9 @@ VOLUME_MAX_GB: int = int(os.environ.get("VOLUME_MAX_GB", "240"))
 
 # --- Pyrogram tuning ---
 MAX_CONCURRENT_TRANSMISSIONS: int = int(
-    os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "3")
+    os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "10")
 )
-TG_DOWNLOAD_WORKERS: int = int(os.environ.get("TG_DOWNLOAD_WORKERS", "3"))
+TG_DOWNLOAD_WORKERS: int = int(os.environ.get("TG_DOWNLOAD_WORKERS", "10"))
 
 # --- Web upload ---
 UPLOAD_CHUNK_SIZE: int = int(os.environ.get("UPLOAD_CHUNK_SIZE", str(50 * 1024 * 1024)))  # 50 MB
@@ -50,7 +50,7 @@ ALLOWED_USERS: set[int] = (
 )
 
 # --- ARQ workers ---
-ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "20"))
+ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "50"))
 
 # --- Scan workers (parallel ripgrep processes) ---
-SCAN_WORKERS: int = int(os.environ.get("SCAN_WORKERS", "8"))
+SCAN_WORKERS: int = int(os.environ.get("SCAN_WORKERS", "64"))

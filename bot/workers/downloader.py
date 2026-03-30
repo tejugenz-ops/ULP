@@ -62,18 +62,24 @@ async def download_telegram_file(
 
         size = await local.get_file_size(dest)
 
-        # Move to bucket for permanent storage
-        bkey = bucket.bucket_key(user_id, file_id, original_name)
-        await bucket.upload_file(dest, bkey)
-
+        # Mark READY immediately so scanning can start
         await crud.update_file(
             file_id,
             status=FileStatus.READY,
             local_path=str(dest),
-            bucket_key=bkey,
             size_bytes=size,
         )
         await crud.update_job(job_id, status=JobStatus.COMPLETED, progress=100)
+
+        # Upload to bucket in background — don't block scanning
+        async def _bg_upload():
+            try:
+                bkey = bucket.bucket_key(user_id, file_id, original_name)
+                await bucket.upload_file(dest, bkey)
+                await crud.update_file(file_id, bucket_key=bkey)
+            except Exception as exc:
+                log.warning("Background bucket upload failed for %s: %s", file_id, exc)
+        asyncio.create_task(_bg_upload())
 
         if not silent:
             await tg.send_message(
@@ -172,17 +178,24 @@ async def download_url(
         dest = dest_dir / original_name
         size = await local.get_file_size(dest)
 
-        bkey = bucket.bucket_key(user_id, file_id, original_name)
-        await bucket.upload_file(dest, bkey)
-
+        # Mark READY immediately so scanning can start
         await crud.update_file(
             file_id,
             status=FileStatus.READY,
             local_path=str(dest),
-            bucket_key=bkey,
             size_bytes=size,
         )
         await crud.update_job(job_id, status=JobStatus.COMPLETED, progress=100)
+
+        # Upload to bucket in background — don't block scanning
+        async def _bg_upload():
+            try:
+                bkey = bucket.bucket_key(user_id, file_id, original_name)
+                await bucket.upload_file(dest, bkey)
+                await crud.update_file(file_id, bucket_key=bkey)
+            except Exception as exc:
+                log.warning("Background bucket upload failed for %s: %s", file_id, exc)
+        asyncio.create_task(_bg_upload())
 
         await tg.send_message(
             chat_id,
