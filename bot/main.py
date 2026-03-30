@@ -12,6 +12,7 @@ from urllib.request import urlopen
 
 import uvicorn
 
+import bot.patches  # noqa: F401  — must run before any Session.start()
 from bot.config import REDIS_URL
 from bot.db.models import init_db
 from bot.telegram.bot import app as tg_app
@@ -106,12 +107,28 @@ async def main():
         Path(f).unlink(missing_ok=True)
         log.info("Removed session file: %s", f)
 
-    # ── Start Pyrogram ──
-    # Brief cooldown — Telegram may rate-limit IPs that had connection storms.
-    log.info("Starting Telegram bot (cooldown 10s)...")
-    await asyncio.sleep(10)
-
-    await tg_app.start()
+    # ── Start Pyrogram (with outer retry) ──
+    log.info("Starting Telegram bot...")
+    max_outer = 3
+    for outer in range(1, max_outer + 1):
+        try:
+            await tg_app.start()
+            break
+        except (ConnectionError, OSError, Exception) as exc:
+            log.error("tg_app.start() attempt %d/%d failed: %s", outer, max_outer, exc)
+            try:
+                await tg_app.stop()
+            except Exception:
+                pass
+            # Re-clean session files before next attempt
+            for f in glob.glob(session_base + "*"):
+                Path(f).unlink(missing_ok=True)
+            if outer < max_outer:
+                wait = 30 * outer
+                log.info("Waiting %ds before next start attempt…", wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
 
     me = await tg_app.get_me()
     log.info("Bot authenticated as @%s (id=%s)", me.username, me.id)
