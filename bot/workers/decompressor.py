@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -82,13 +83,12 @@ async def extract_archive(
             f"📦 Extracting `{file_record.original_name}`...",
         )
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
         )
-        stdout, _ = await proc.communicate()
-        output = stdout.decode(errors="replace")
+        output = proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace")
 
         if proc.returncode != 0:
             # Check if password is needed
