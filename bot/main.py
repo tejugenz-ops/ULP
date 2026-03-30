@@ -78,11 +78,8 @@ async def main():
     web_thread.start()
     log.info("Web server started in background thread on :8080")
 
-    # Start ARQ worker as background task
-    arq_task = asyncio.create_task(start_arq_worker())
-    log.info("ARQ worker started")
-
-    # Start Pyrogram bot
+    # Start Pyrogram bot FIRST — must be fully connected before ARQ workers
+    # can send messages through the client
     log.info("Starting Telegram bot...")
     await tg_app.start()
 
@@ -104,6 +101,10 @@ async def main():
             log.info("getWebhookInfo: %s", resp.read().decode())
     except Exception as e:
         log.warning("Could not get webhook info: %s", e)
+
+    # NOW start ARQ worker — Pyrogram is ready so workers can send messages safely
+    arq_task = asyncio.create_task(start_arq_worker())
+    log.info("ARQ worker started")
 
     log.info("Bot is running! Send /start to test.")
 
