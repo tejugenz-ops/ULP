@@ -6,6 +6,7 @@ Pyrogram runs as the primary async loop owner; FastAPI runs in a thread.
 import asyncio
 import logging
 import threading
+from pathlib import Path
 from urllib.request import urlopen
 
 import uvicorn
@@ -81,6 +82,14 @@ async def main():
     # Start Pyrogram bot FIRST — must be fully connected before ARQ workers
     # can send messages through the client
     log.info("Starting Telegram bot...")
+
+    # Delete stale session file to prevent corrupted auth_key / msg_id loops.
+    # Bot tokens re-authenticate instantly so there's nothing valuable to keep.
+    session_path = Path(tg_app.workdir) / f"{tg_app.name}.session"
+    if session_path.exists():
+        session_path.unlink()
+        log.info("Removed stale session file: %s", session_path)
+
     await tg_app.start()
 
     me = await tg_app.get_me()
