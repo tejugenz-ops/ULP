@@ -23,6 +23,27 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+async def _extract_pending_archives():
+    """Find READY archives with no children and enqueue extraction."""
+    from bot.db import crud
+    from bot.workers.downloader import ARCHIVE_EXTENSIONS, _auto_extract
+
+    try:
+        archives = await crud.list_unextracted_archives(ARCHIVE_EXTENSIONS)
+        if not archives:
+            log.info("No pending archives to extract.")
+            return
+        log.info("Found %d unextracted archive(s), enqueuing...", len(archives))
+        for f in archives:
+            try:
+                await _auto_extract(f.user_id, str(f.id), f.user_id)  # chat_id = user_id for private chats
+                log.info("Enqueued extraction for %s (%s)", f.original_name, f.id)
+            except Exception:
+                log.exception("Failed to enqueue extraction for %s", f.id)
+    except Exception:
+        log.exception("Error scanning for pending archives")
+
+
 def start_web_server():
     """Run FastAPI/uvicorn in a daemon thread."""
     config = uvicorn.Config(
@@ -85,6 +106,9 @@ async def main():
         log.warning("Could not get webhook info: %s", e)
 
     log.info("Bot is running! Send /start to test.")
+
+    # Extract any already-downloaded archives that haven't been extracted yet
+    asyncio.create_task(_extract_pending_archives())
 
     # Use Pyrogram's idle to keep the bot alive
     from pyrogram import idle

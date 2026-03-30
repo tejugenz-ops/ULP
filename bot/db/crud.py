@@ -121,6 +121,30 @@ async def list_all_ready_files() -> list[File]:
         return list(result.scalars().all())
 
 
+async def list_unextracted_archives(extensions: set[str]) -> list[File]:
+    """Return READY files whose names end with an archive extension and have no children."""
+    from sqlalchemy import exists, or_
+    from sqlalchemy.orm import aliased
+
+    ext_filters = [func.lower(File.original_name).like(f"%{ext}") for ext in extensions]
+    ChildFile = aliased(File)
+    async with _session() as s:
+        stmt = (
+            select(File)
+            .where(
+                File.status == FileStatus.READY,
+                ~exists(
+                    select(ChildFile.id).where(ChildFile.parent_id == File.id)
+                ),
+            )
+            .order_by(File.created_at.asc())
+        )
+        if ext_filters:
+            stmt = stmt.where(or_(*ext_filters))
+        result = await s.execute(stmt)
+        return list(result.scalars().all())
+
+
 async def delete_file(file_id: _ID) -> None:
     fid = _uuid(file_id)
     async with _session() as s:
