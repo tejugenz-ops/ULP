@@ -145,6 +145,18 @@ async def list_unextracted_archives(extensions: set[str]) -> list[File]:
         return list(result.scalars().all())
 
 
+async def delete_children(file_id: _ID) -> int:
+    """Delete all child files that reference this parent. Returns count deleted."""
+    from sqlalchemy import delete as sa_delete
+    fid = _uuid(file_id)
+    async with _session() as s:
+        result = await s.execute(
+            sa_delete(File).where(File.parent_id == fid)
+        )
+        await s.commit()
+        return result.rowcount  # type: ignore[return-value]
+
+
 async def delete_file(file_id: _ID) -> None:
     fid = _uuid(file_id)
     async with _session() as s:

@@ -64,7 +64,18 @@ async def extract_archive(
 
         if not filepath.exists():
             await tg.send_message(chat_id, "❌ File not found.")
+            await crud.update_file(file_id, status=FileStatus.ERROR)
             await crud.update_job(job_id, status=JobStatus.FAILED, error_message="File missing")
+            return
+
+        if filepath.stat().st_size == 0:
+            log.warning("Skipping 0-byte archive: %s", filepath)
+            await crud.update_file(file_id, status=FileStatus.ERROR)
+            await crud.update_job(job_id, status=JobStatus.FAILED, error_message="Archive is 0 bytes")
+            try:
+                await tg.send_message(chat_id, f"⚠️ `{file_record.original_name}` is 0 bytes — skipped.")
+            except Exception:
+                pass
             return
 
         # Create extraction output directory
@@ -183,6 +194,7 @@ async def extract_archive(
 
     except Exception as e:
         log.exception("Extraction failed: %s", e)
+        await crud.update_file(file_id, status=FileStatus.ERROR)
         await crud.update_job(job_id, status=JobStatus.FAILED, error_message=str(e))
         try:
             from bot.telegram.bot import app as tg
@@ -210,6 +222,7 @@ async def _delete_archive(file_id: str, filepath: Path, bucket_key: str | None) 
             log.warning("Failed to delete archive from bucket: %s", exc)
 
     try:
+        await crud.delete_children(file_id)
         await crud.delete_file(file_id)
     except Exception as exc:
         log.warning("Failed to delete archive DB record: %s", exc)
