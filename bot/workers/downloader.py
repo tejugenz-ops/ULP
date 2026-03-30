@@ -57,7 +57,7 @@ async def download_telegram_file(
             await tg.download_media(
                 telegram_file_id,
                 file_name=str(dest),
-                progress=tracker,
+                progress=tracker.__call__ if tracker else None,
             )
 
         size = await local.get_file_size(dest)
@@ -82,15 +82,20 @@ async def download_telegram_file(
         asyncio.create_task(_bg_upload())
 
         if not silent:
-            await tg.send_message(
-                chat_id,
-                f"✅ **Download complete!**\n"
-                f"📄 `{original_name}`\n"
-                f"📦 Size: {_human(size)}\n"
-                f"🔑 File ID: `{file_id}`\n\n"
-                f"Use `/search {file_id} <pattern>` to search\n"
-                f"Use `/unzip {file_id}` to extract archives",
-            )
+            async def _notify():
+                try:
+                    await tg.send_message(
+                        chat_id,
+                        f"✅ **Download complete!**\n"
+                        f"📄 `{original_name}`\n"
+                        f"📦 Size: {_human(size)}\n"
+                        f"🔑 File ID: `{file_id}`\n\n"
+                        f"Use `/search {file_id} <pattern>` to search\n"
+                        f"Use `/unzip {file_id}` to extract archives",
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_notify())
     except Exception as e:
         log.exception("Telegram download failed: %s", e)
         await crud.update_file(file_id, status=FileStatus.ERROR, error_message=str(e))

@@ -50,9 +50,7 @@ async def main():
 
     # Import handlers to register them BEFORE starting the client
     import bot.telegram.handlers  # noqa: F401
-    log.info("Handlers registered: %s", [
-        type(h).__name__ for g in tg_app.dispatcher.groups.values() for h in g
-    ])
+    log.info("Handler module loaded")
 
     # Start FastAPI in a daemon thread (won't block asyncio loop)
     web_thread = threading.Thread(target=start_web_server, daemon=True)

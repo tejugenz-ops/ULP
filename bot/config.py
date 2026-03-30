@@ -32,9 +32,9 @@ VOLUME_MAX_GB: int = int(os.environ.get("VOLUME_MAX_GB", "240"))
 
 # --- Pyrogram tuning ---
 MAX_CONCURRENT_TRANSMISSIONS: int = int(
-    os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "10")
+    os.environ.get("MAX_CONCURRENT_TRANSMISSIONS", "5")
 )
-TG_DOWNLOAD_WORKERS: int = int(os.environ.get("TG_DOWNLOAD_WORKERS", "10"))
+TG_DOWNLOAD_WORKERS: int = int(os.environ.get("TG_DOWNLOAD_WORKERS", "4"))
 
 # --- Web upload ---
 UPLOAD_CHUNK_SIZE: int = int(os.environ.get("UPLOAD_CHUNK_SIZE", str(50 * 1024 * 1024)))  # 50 MB
