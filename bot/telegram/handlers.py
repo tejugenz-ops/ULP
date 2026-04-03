@@ -59,6 +59,48 @@ pending_archive_pw: dict[int, str] = {}
 # flooding the chat with one message per file.
 _file_button_msg: dict[int, int] = {}  # user_id → message_id
 
+# ── Collection mode state ──
+_collect_state: dict[int, dict] = {}  # user_id → {items: [{msg_id, file_id, name}], timer, asked}
+
+
+def _reset_collect(user_id: int):
+    st = _collect_state.pop(user_id, None)
+    if st and st.get("timer"):
+        st["timer"].cancel()
+
+
+async def _collect_ask(user_id: int, chat_id: int):
+    """Fire after 3s inactivity to ask if collection is complete."""
+    await asyncio.sleep(3)
+    st = _collect_state.get(user_id)
+    if not st or not st["items"] or st.get("asked"):
+        return
+    st["asked"] = True
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Done \u2014 download all", callback_data="collect:done")],
+        [InlineKeyboardButton("Export .txt only", callback_data="collect:txt")],
+        [InlineKeyboardButton("Cancel", callback_data="collect:cancel")],
+    ])
+    try:
+        await app.send_message(
+            chat_id,
+            f"\U0001f4e5 **{len(st['items'])}** file(s) collected.\n\nAre these all?",
+            reply_markup=kb,
+        )
+    except Exception:
+        pass
+
+
+def _restart_collect_timer(user_id: int, chat_id: int):
+    st = _collect_state.get(user_id)
+    if not st:
+        return
+    if st.get("timer"):
+        st["timer"].cancel()
+    st["asked"] = False
+    st["timer"] = asyncio.create_task(_collect_ask(user_id, chat_id))
+
+
 MAX_GUIDED_FILES = 999999
 MAX_GUIDED_KEYWORDS = 999999
 
@@ -245,6 +287,17 @@ async def on_document(_, message: Message):
 
     doc = message.document
     original_name = doc.file_name or f"file_{doc.file_id}"
+
+    # ── Collect mode — store file, don't download yet ──
+    collect = _collect_state.get(message.from_user.id)
+    if collect is not None:
+        collect["items"].append({
+            "message_id": message.id,
+            "file_id": doc.file_id,
+            "name": original_name,
+        })
+        _restart_collect_timer(message.from_user.id, message.chat.id)
+        return
 
     await crud.get_or_create_user(
         message.from_user.id,
@@ -617,6 +670,24 @@ async def cmd_stop(_, message: Message):
         )
 
 
+# ── /collect — Collect files then batch-download ─────────────────────
+
+
+@app.on_message(filters.command("collect") & filters.private)
+async def cmd_collect(_, message: Message):
+    if not _authorized(message.from_user.id):
+        return await message.reply("⛔ You are not authorized.")
+    uid = message.from_user.id
+    _reset_collect(uid)
+    await crud.get_or_create_user(uid, message.from_user.username, message.from_user.first_name)
+    _collect_state[uid] = {"items": [], "timer": None, "asked": False}
+    await message.reply(
+        "\U0001f4e5 **Collection mode started.**\n\n"
+        "Send or forward files. After you stop sending, I'll ask if you're done.\n"
+        "Then I'll batch-download everything."
+    )
+
+
 # ── /d — Batch download from file_id .txt ────────────────────────────
 
 
@@ -799,7 +870,157 @@ async def on_archive_cancel(_, callback: CallbackQuery):
     await callback.answer()
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop", "d"]))
+# ── Collect-mode callbacks ────────────────────────────────────────────
+
+
+@app.on_callback_query(filters.regex(r"^collect:(done|cancel|txt)$"))
+async def on_collect_action(_, callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not _authorized(uid):
+        return await callback.answer("Not authorized", show_alert=True)
+
+    action = callback.data.split(":", 1)[1]
+
+    if action == "cancel":
+        _reset_collect(uid)
+        await callback.message.edit_text("❌ Collection cancelled.")
+        return await callback.answer()
+
+    st = _collect_state.get(uid)
+    if not st or not st["items"]:
+        return await callback.answer("No files collected!", show_alert=True)
+
+    items = list(st["items"])
+    count = len(items)
+    _reset_collect(uid)
+    chat_id = callback.message.chat.id
+    await callback.answer()
+
+    # ── Export .txt with file_ids ──
+    file_ids_text = "\n".join(item["file_id"] for item in items)
+    import tempfile as _tmpmod
+    txt_path = Path(_tmpmod.gettempdir()) / f"file_ids_{uid}.txt"
+    txt_path.write_text(file_ids_text, encoding="utf-8")
+    try:
+        await app.send_document(chat_id, str(txt_path),
+                                caption=f"{count} file IDs exported.",
+                                file_name="file_ids.txt")
+    except Exception:
+        pass
+    finally:
+        txt_path.unlink(missing_ok=True)
+
+    block = f"```\n{file_ids_text}\n```"
+    if len(block) <= 4096:
+        try:
+            await app.send_message(chat_id, block)
+        except Exception:
+            pass
+
+    if action == "txt":
+        await callback.message.edit_text(f"✅ **{count}** file ID(s) exported.")
+        return
+
+    # ── action == "done" → batch download ──
+    await callback.message.edit_text(
+        f"✅ **{count}** file(s) collected. Starting batch download..."
+    )
+
+    from bot.workers._arq import enqueue
+
+    job_map: list[dict] = []
+    for item in items:
+        # Re-fetch message so Pyrogram returns a fresh file_reference
+        try:
+            fresh = await app.get_messages(chat_id, item["message_id"])
+            fid = (fresh.document.file_id
+                   if fresh and fresh.document else item["file_id"])
+        except Exception:
+            fid = item["file_id"]
+
+        name = item["name"]
+        file_record = await crud.create_file(user_id=uid, original_name=name)
+        job = await crud.create_job(
+            user_id=uid, job_type=JobType.DOWNLOAD_TELEGRAM,
+            file_id=file_record.id,
+        )
+        job_map.append({
+            "job_id": str(job.id),
+            "file_id": str(file_record.id),
+            "name": name,
+        })
+        await enqueue(
+            "download_telegram_file",
+            user_id=uid,
+            file_id=str(file_record.id),
+            telegram_file_id=fid,
+            original_name=name,
+            job_id=str(job.id),
+            chat_id=chat_id,
+            silent=True,
+        )
+
+    # ── Progress poll (shared logic with /d) ──
+    total = count
+    status_msg = None
+    try:
+        status_msg = await app.send_message(
+            chat_id, f"⬇️ **Batch download:** 0/{total} (0%)")
+    except Exception:
+        pass
+    smid = status_msg.id if status_msg else 0
+
+    job_ids = [j["job_id"] for j in job_map]
+    last_edit = 0.0
+
+    while True:
+        await asyncio.sleep(3)
+        counts = await crud.count_job_statuses(job_ids)
+        done = (counts.get("completed", 0) + counts.get("failed", 0)
+                + counts.get("cancelled", 0))
+        failed = counts.get("failed", 0)
+        running_names: list[str] = []
+
+        if done < total:
+            for jm in job_map:
+                j = await crud.get_job(jm["job_id"])
+                if j and j.status == JobStatus.RUNNING:
+                    running_names.append(jm["name"])
+                    if len(running_names) >= 2:
+                        break
+
+        pct = int(done * 100 / total) if total else 100
+        text = f"⬇️ **Batch download:** {done}/{total} ({pct}%)"
+        if running_names:
+            text += f"\n📥 Downloading: {', '.join(running_names[:2])}"
+
+        now = time.monotonic()
+        if smid and now - last_edit >= 5.0:
+            try:
+                await app.edit_message_text(chat_id, smid, text)
+                last_edit = now
+            except Exception:
+                pass
+
+        if done >= total:
+            break
+
+    total_bytes = 0
+    for jm in job_map:
+        f = await crud.get_file(jm["file_id"])
+        if f and f.size_bytes:
+            total_bytes += f.size_bytes
+    summary = f"✅ **Batch complete!**\n📁 {total} file(s) — {_human(total_bytes)}"
+    if failed:
+        summary += f"\n⚠️ {failed} failed"
+    if smid:
+        try:
+            await app.edit_message_text(chat_id, smid, summary)
+        except Exception:
+            pass
+
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop", "d", "collect"]))
 async def on_guided_keywords(_, message: Message):
     try:
         user_id = message.from_user.id
