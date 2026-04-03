@@ -25,6 +25,23 @@ import time
 
 upload_tokens: dict[str, dict] = {}  # token → {"user_id": int, "expires": float}
 
+# ── Flood-aware reply helper ──
+_flood_until = 0.0  # monotonic timestamp when SendMessage flood expires
+
+
+async def _safe_reply(message, text, **kwargs):
+    """Reply, skipping the API call entirely when flood-limited."""
+    global _flood_until
+    now = time.monotonic()
+    if now < _flood_until:
+        return None
+    try:
+        return await message.reply(text, **kwargs)
+    except FloodWait as e:
+        _flood_until = now + e.value
+        log.warning("FloodWait %ds on reply, skipping", e.value)
+        return None
+
 
 @dataclass
 class GuidedSession:
@@ -200,12 +217,8 @@ async def cmd_download(_, message: Message):
         file_id=file_record.id,
     )
 
-    try:
-        status_msg = await message.reply("⬇️ **Starting URL download...")
-        status_message_id = status_msg.id
-    except FloodWait as e:
-        log.warning("FloodWait %ss on URL download reply, proceeding silently", e.value)
-        status_message_id = 0
+    status_msg = await _safe_reply(message, "⬇️ **Starting URL download...")
+    status_message_id = status_msg.id if status_msg else 0
 
     # Enqueue download job via ARQ
     from bot.workers._arq import enqueue
@@ -245,7 +258,8 @@ async def on_document(_, message: Message):
         existing = await crud.find_file_by_unique_id(unique_id)
         if existing:
             status_label = "already downloaded" if existing.status.value == "ready" else "already downloading"
-            await message.reply(
+            await _safe_reply(
+                message,
                 f"♻️ **Duplicate skipped** — `{existing.original_name}` is {status_label}."
             )
             # Still track in guided session so user doesn't re-send
@@ -309,19 +323,17 @@ async def on_document(_, message: Message):
                 )
             except Exception:
                 # Message may have been deleted or too old — send a new one
-                sent = await message.reply(text, reply_markup=kb)
-                _file_button_msg[message.from_user.id] = sent.id
+                sent = await _safe_reply(message, text, reply_markup=kb)
+                if sent:
+                    _file_button_msg[message.from_user.id] = sent.id
         else:
-            sent = await message.reply(text, reply_markup=kb)
-            _file_button_msg[message.from_user.id] = sent.id
+            sent = await _safe_reply(message, text, reply_markup=kb)
+            if sent:
+                _file_button_msg[message.from_user.id] = sent.id
     else:
         # Non-guided: full progress + completion message
-        try:
-            status_msg = await message.reply("⬇️ **Downloading file from Telegram...**")
-            status_message_id = status_msg.id
-        except FloodWait as e:
-            log.warning("FloodWait %ss on download reply, proceeding silently", e.value)
-            status_message_id = 0
+        status_msg = await _safe_reply(message, "⬇️ **Downloading file from Telegram...**")
+        status_message_id = status_msg.id if status_msg else 0
         await enqueue(
             "download_telegram_file",
             user_id=message.from_user.id,
@@ -387,12 +399,8 @@ async def cmd_search(_, message: Message):
         file_id=uuid.UUID(file_id),
     )
 
-    try:
-        status_msg = await message.reply(f"🔍 Searching for `{pattern}`...\nProgress: 0%")
-        status_message_id = status_msg.id
-    except FloodWait as e:
-        log.warning("FloodWait %ss on search reply, proceeding silently", e.value)
-        status_message_id = 0
+    status_msg = await _safe_reply(message, f"\U0001f50d Searching for `{pattern}`...\nProgress: 0%")
+    status_message_id = status_msg.id if status_msg else 0
 
     from bot.workers._arq import enqueue
 
@@ -552,7 +560,7 @@ async def cmd_status(_, message: Message):
             pct = f" — {j.progress}%" if j.progress else ""
             lines.append(f"🔄 `{j.job_type.value}`{pct}")
 
-    await message.reply("\n".join(lines))
+    await _safe_reply(message, "\n".join(lines))
 
 
 # ── /cancel <job_id> ─────────────────────────────────────────────────
@@ -743,15 +751,12 @@ async def on_guided_keywords(_, message: Message):
             file_id=primary_file_id,
         )
 
-        try:
-            status_msg = await message.reply(
-                f"🚀 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
-                "Progress: 0%"
-            )
-            status_message_id = status_msg.id
-        except FloodWait as e:
-            log.warning("FloodWait %ss on extraction reply, proceeding silently", e.value)
-            status_message_id = 0
+        status_msg = await _safe_reply(
+            message,
+            f"\U0001f680 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
+            "Progress: 0%"
+        )
+        status_message_id = status_msg.id if status_msg else 0
 
         from bot.workers._arq import enqueue
 
