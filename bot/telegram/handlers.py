@@ -617,6 +617,141 @@ async def cmd_stop(_, message: Message):
         )
 
 
+# ── /d — Batch download from file_id .txt ────────────────────────────
+
+
+@app.on_message(filters.command("d") & filters.private & filters.reply)
+async def cmd_batch_download(_, message: Message):
+    if not _authorized(message.from_user.id):
+        return await message.reply("\u26d4 You are not authorized.")
+
+    replied = message.reply_to_message
+    if not replied or not replied.document:
+        return await message.reply("\u274c Reply to a .txt file with /d")
+
+    doc = replied.document
+    if not (doc.file_name or "").lower().endswith(".txt"):
+        return await message.reply("\u274c The replied file must be a .txt")
+
+    await crud.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+    )
+
+    # Download the .txt
+    import tempfile as _tmpmod
+    tmp = Path(_tmpmod.gettempdir()) / f"batch_{message.from_user.id}.txt"
+    try:
+        await app.download_media(doc.file_id, file_name=str(tmp))
+        content = tmp.read_text(encoding="utf-8", errors="ignore")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    file_ids = [line.strip() for line in content.splitlines() if line.strip()]
+    if not file_ids:
+        return await message.reply("\u274c The .txt file is empty or has no valid lines.")
+
+    total = len(file_ids)
+    status_msg = await _safe_reply(
+        message,
+        f"\u2b07\ufe0f **Batch download starting...**\n{total} file(s) queued."
+    )
+    status_message_id = status_msg.id if status_msg else 0
+
+    from bot.workers._arq import enqueue
+
+    job_map: list[dict] = []  # [{job_id, name, telegram_file_id}]
+
+    for i, tg_fid in enumerate(file_ids):
+        name = f"file_{i+1}"
+        file_record = await crud.create_file(
+            user_id=message.from_user.id,
+            original_name=name,
+        )
+        job = await crud.create_job(
+            user_id=message.from_user.id,
+            job_type=JobType.DOWNLOAD_TELEGRAM,
+            file_id=file_record.id,
+        )
+        job_map.append({
+            "job_id": str(job.id),
+            "file_id": str(file_record.id),
+            "name": name,
+            "telegram_file_id": tg_fid,
+        })
+        await enqueue(
+            "download_telegram_file",
+            user_id=message.from_user.id,
+            file_id=str(file_record.id),
+            telegram_file_id=tg_fid,
+            original_name=name,
+            job_id=str(job.id),
+            chat_id=message.chat.id,
+            silent=True,
+        )
+
+    # Poll for progress
+    chat_id = message.chat.id
+    job_ids = [j["job_id"] for j in job_map]
+    last_edit = 0.0
+
+    while True:
+        await asyncio.sleep(3)
+        counts = await crud.count_job_statuses(job_ids)
+        done = counts.get("completed", 0) + counts.get("failed", 0) + counts.get("cancelled", 0)
+        failed = counts.get("failed", 0)
+        running_names = []
+
+        if done < total:
+            # Find a currently downloading file name for display
+            for jm in job_map:
+                j = await crud.get_job(jm["job_id"])
+                if j and j.status == JobStatus.RUNNING:
+                    running_names.append(jm["name"])
+                    if len(running_names) >= 2:
+                        break
+
+        pct = int(done * 100 / total) if total else 100
+        current = ", ".join(running_names[:2]) if running_names else "..."
+        text = f"\u2b07\ufe0f **Batch download:** {done}/{total} ({pct}%)"
+        if running_names:
+            text += f"\n\U0001f4e5 Downloading: {current}"
+
+        now = time.monotonic()
+        if status_message_id and now - last_edit >= 5.0:
+            try:
+                await app.edit_message_text(chat_id, status_message_id, text)
+                last_edit = now
+            except Exception:
+                pass
+
+        if done >= total:
+            break
+
+    # Final summary
+    total_bytes = 0
+    for jm in job_map:
+        f = await crud.get_file(jm["file_id"])
+        if f and f.size_bytes:
+            total_bytes += f.size_bytes
+
+    summary = (
+        f"\u2705 **Batch complete!**\n"
+        f"\U0001f4c1 {total} file(s) \u2014 {_human(total_bytes)}"
+    )
+    if failed:
+        summary += f"\n\u26a0\ufe0f {failed} failed"
+
+    if status_message_id:
+        try:
+            await app.edit_message_text(chat_id, status_message_id, summary)
+        except Exception:
+            await _safe_reply(message, summary)
+    else:
+        await _safe_reply(message, summary)
+
+
 @app.on_callback_query(filters.regex(r"^archcancel:"))
 async def on_archive_cancel(_, callback: CallbackQuery):
     """Cancel a password-protected archive and delete it."""
@@ -664,7 +799,7 @@ async def on_archive_cancel(_, callback: CallbackQuery):
     await callback.answer()
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "upload", "download", "files", "search", "unzip", "delete", "status", "cancel", "scan", "stop", "d"]))
 async def on_guided_keywords(_, message: Message):
     try:
         user_id = message.from_user.id

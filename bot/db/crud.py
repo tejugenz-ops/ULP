@@ -285,6 +285,20 @@ async def cancel_user_jobs(user_id: int) -> int:
         return result.rowcount
 
 
+async def count_job_statuses(job_ids: list[str]) -> dict[str, int]:
+    """Count jobs by status for a list of job IDs. Returns {status_value: count}."""
+    if not job_ids:
+        return {}
+    uuids = [_uuid(j) for j in job_ids]
+    async with _session() as s:
+        rows = (await s.execute(
+            select(Job.status, func.count())
+            .where(Job.id.in_(uuids))
+            .group_by(Job.status)
+        )).all()
+        return {row[0].value: int(row[1]) for row in rows}
+
+
 async def cancel_all_jobs() -> int:
     """Cancel ALL active jobs across all users. Returns count."""
     async with _session() as s:
