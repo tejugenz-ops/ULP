@@ -273,65 +273,61 @@ async def extract_keywords_batch(
 
         total_files = len(file_ids)
 
-        await _set_progress(
-            f"⬇️ **Downloading**\n"
-            f"{_bar(0)} 0%\n"
-            f"Files: 0/{total_files} ready\n"
-            f"Downloaded: 0 B / ?"
-        )
+        # ─── Phase 1: Gather files, wait only if some are still downloading ──
 
-        # ─── Phase 1: Wait for downloads ─────────────────────────
-        wait_cycles = 0
-        while True:
-            wait_cycles += 1
-            ready_count = 0
-            error_count = 0
-            ready_bytes = 0
-            total_bytes = 0
-            for fid in file_ids:
-                fr = await crud.get_file(fid)
-                if not fr:
-                    continue
-                fsize = fr.size_bytes or 0
-                total_bytes += fsize
-                if fr.status == FileStatus.READY and fr.local_path:
-                    ready_count += 1
-                    ready_bytes += fsize
-                elif fr.status == FileStatus.ERROR:
-                    error_count += 1
+        all_files = await crud.get_files_bulk(file_ids)
+        files_by_id = {str(f.id): f for f in all_files}
 
-            if ready_count + error_count >= total_files:
-                break
+        not_ready = [
+            f for f in all_files
+            if f.status not in (FileStatus.READY, FileStatus.ERROR)
+        ]
 
-            pct = int((ready_bytes / max(1, total_bytes)) * 100) if total_bytes else 0
-            err_line = f"\n⚠️ Failed: {error_count}" if error_count else ""
+        if not_ready:
             await _set_progress(
                 f"⬇️ **Downloading**\n"
-                f"{_bar(pct)} {pct}%\n"
-                f"Files: {ready_count}/{total_files} ready\n"
-                f"Downloaded: {_human_bytes(ready_bytes)} / {_human_bytes(total_bytes)}"
-                f"{err_line}"
+                f"{_bar(0)} 0%\n"
+                f"Files: {len(all_files) - len(not_ready)}/{total_files} ready\n"
+                f"Downloaded: 0 B / ?"
             )
-            await asyncio.sleep(2)
 
-            if wait_cycles > 600:  # ~20 min safety stop
-                break
+            wait_cycles = 0
+            while not_ready and wait_cycles < 600:
+                wait_cycles += 1
+                await asyncio.sleep(2)
 
-        # Gather file info for scanning phase — only use files already on disk
-        scan_files: list[tuple[str, Path, int]] = []  # (file_id, path, size)
+                all_files = await crud.get_files_bulk(file_ids)
+                files_by_id = {str(f.id): f for f in all_files}
+                not_ready = [
+                    f for f in all_files
+                    if f.status not in (FileStatus.READY, FileStatus.ERROR)
+                ]
+
+                ready_count = sum(1 for f in all_files if f.status == FileStatus.READY and f.local_path)
+                error_count = sum(1 for f in all_files if f.status == FileStatus.ERROR)
+                ready_bytes = sum(f.size_bytes or 0 for f in all_files if f.status == FileStatus.READY)
+                total_bytes = sum(f.size_bytes or 0 for f in all_files)
+
+                pct = int((ready_bytes / max(1, total_bytes)) * 100) if total_bytes else 0
+                err_line = f"\n⚠️ Failed: {error_count}" if error_count else ""
+                await _set_progress(
+                    f"⬇️ **Downloading**\n"
+                    f"{_bar(pct)} {pct}%\n"
+                    f"Files: {ready_count}/{total_files} ready\n"
+                    f"Downloaded: {_human_bytes(ready_bytes)} / {_human_bytes(total_bytes)}"
+                    f"{err_line}"
+                )
+
+        # ─── Gather files that are on disk ────────────────────────
+
+        scan_files: list[tuple[str, Path, int]] = []
         skipped = 0
-        for fid in file_ids:
-            fr = await crud.get_file(fid)
-            if not fr:
-                continue
-
+        for fid_str, fr in files_by_id.items():
             filepath = Path(fr.local_path) if fr.local_path else None
-
             if not filepath or not filepath.exists():
                 skipped += 1
                 continue
-
-            scan_files.append((str(fr.id), filepath, fr.size_bytes or 0))
+            scan_files.append((fid_str, filepath, fr.size_bytes or 0))
 
         if skipped:
             log.info("Scan: %d file(s) skipped (not on local volume)", skipped)

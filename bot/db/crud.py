@@ -101,6 +101,16 @@ async def get_file(file_id: _ID) -> File | None:
         return await s.get(File, fid)
 
 
+async def get_files_bulk(file_ids: list[_ID]) -> list[File]:
+    """Fetch many files in a single query."""
+    uuids = [_uuid(fid) for fid in file_ids]
+    async with _session() as s:
+        result = await s.execute(
+            select(File).where(File.id.in_(uuids))
+        )
+        return list(result.scalars().all())
+
+
 async def list_user_files(user_id: int) -> list[File]:
     async with _session() as s:
         result = await s.execute(
