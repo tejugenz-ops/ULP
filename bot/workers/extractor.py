@@ -317,8 +317,9 @@ async def extract_keywords_batch(
             if wait_cycles > 600:  # ~20 min safety stop
                 break
 
-        # Gather file info for scanning phase
+        # Gather file info for scanning phase — only use files already on disk
         scan_files: list[tuple[str, Path, int]] = []  # (file_id, path, size)
+        skipped = 0
         for fid in file_ids:
             fr = await crud.get_file(fid)
             if not fr:
@@ -326,19 +327,27 @@ async def extract_keywords_batch(
 
             filepath = Path(fr.local_path) if fr.local_path else None
 
-            if (not filepath or not filepath.exists()) and fr.bucket_key:
-                from bot.storage import bucket, local
-                dest_dir = local.user_dir(user_id, str(fr.id))
-                filepath = dest_dir / fr.original_name
-                try:
-                    await bucket.download_file(fr.bucket_key, filepath)
-                    await crud.update_file(fr.id, local_path=str(filepath))
-                except Exception as exc:
-                    log.warning("Bucket restore failed for file %s (key=%s): %s", fid, fr.bucket_key, exc)
-                    filepath = None
+            if not filepath or not filepath.exists():
+                skipped += 1
+                continue
 
-            if filepath and filepath.exists():
-                scan_files.append((str(fr.id), filepath, fr.size_bytes or 0))
+            scan_files.append((str(fr.id), filepath, fr.size_bytes or 0))
+
+        if skipped:
+            log.info("Scan: %d file(s) skipped (not on local volume)", skipped)
+
+        if not scan_files:
+            await crud.update_job(
+                job_id,
+                status=JobStatus.FAILED,
+                error_message="No files on local volume",
+            )
+            await tg.send_message(
+                chat_id,
+                f"❌ None of the {total_files} file(s) are on the local volume.\n"
+                "Upload or download files first before scanning.",
+            )
+            return
 
         total_scan_bytes = sum(s for _, _, s in scan_files)
 
