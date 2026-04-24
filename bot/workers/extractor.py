@@ -349,11 +349,19 @@ async def extract_keywords_batch(
 
         # ─── Phase 2: Scan with ripgrep (chunked across files, all keywords per pass) ─
 
-        # Build chunks of files balanced by total bytes so each rg worker reads
-        # roughly the same amount of data. One ripgrep per chunk scans for ALL
-        # keywords in a single pass — each file is read exactly once.
+        # Build many small chunks balanced by total bytes. Many chunks (≫ workers)
+        # gives smooth progress trickle; low concurrency (≤ ~8) avoids NVMe thrash
+        # since 64 parallel ripgreps all reading random offsets ruin throughput.
+        # One ripgrep per chunk scans for ALL keywords in a single pass — each
+        # file is read exactly once.
         sorted_files = sorted(scan_files, key=lambda x: -x[2])  # largest first
-        num_chunks = max(1, min(SCAN_WORKERS, len(sorted_files)))
+        # Aim for ~1 GB per chunk so a typical 360 GB scan = ~360 progress ticks.
+        target_chunk_bytes = 1 * 1024 * 1024 * 1024
+        approx_chunks = max(1, total_scan_bytes // target_chunk_bytes)
+        num_chunks = max(1, min(int(approx_chunks), len(sorted_files)))
+        # Always have at least 4× the worker count so progress feels live.
+        num_chunks = max(num_chunks, min(SCAN_WORKERS * 4, len(sorted_files)))
+
         chunks: list[list[tuple[str, Path, int]]] = [[] for _ in range(num_chunks)]
         chunk_bytes = [0] * num_chunks
         for entry in sorted_files:
@@ -364,12 +372,27 @@ async def extract_keywords_batch(
         # Lowercase keywords once for cheap per-line attribution (rg uses -i).
         kw_lower = [(kw, kw.lower()) for kw in deduped_keywords]
 
+        # Cap concurrency: too many parallel ripgreps thrash the disk and all
+        # finish in lockstep at the end (so progress jumps 0 → 100). Keep it low.
+        max_concurrent = max(1, min(8, SCAN_WORKERS, num_chunks))
+
         log.info(
-            "Scan: starting ripgrep across %d files (%s) in %d chunks for %d keyword(s)",
-            len(scan_files), _human_bytes(total_scan_bytes), num_chunks, len(deduped_keywords),
+            "Scan: starting ripgrep across %d files (%s) in %d chunks, %d concurrent, for %d keyword(s)",
+            len(scan_files), _human_bytes(total_scan_bytes),
+            num_chunks, max_concurrent, len(deduped_keywords),
         )
 
-        sem = asyncio.Semaphore(SCAN_WORKERS)
+        # Send initial progress message IMMEDIATELY so the user sees activity
+        # before the first chunk completes (which may take many seconds).
+        await _set_progress(
+            f"🔎 **Scanning**\n"
+            f"{_bar(0)} 0%\n"
+            f"Chunks: 0/{num_chunks} | 0 B/{_human_bytes(total_scan_bytes)}\n"
+            f"Files: {len(scan_files)} | Workers: {max_concurrent}\n"
+            + " | ".join(f"{kw}: 0" for kw in deduped_keywords)
+        )
+
+        sem = asyncio.Semaphore(max_concurrent)
         done_chunks = 0
         done_bytes = 0
         lock = asyncio.Lock()
@@ -440,7 +463,7 @@ async def extract_keywords_batch(
                             f"{_bar(pct)} {pct}%\n"
                             f"Chunks: {done_chunks}/{num_chunks} | "
                             f"{_human_bytes(done_bytes)}/{_human_bytes(total_scan_bytes)}\n"
-                            f"Files: {len(scan_files)} | Workers: {SCAN_WORKERS}\n"
+                            f"Files: {len(scan_files)} | Workers: {max_concurrent}\n"
                             f"{kw_summary}"
                         )
                     except Exception:
