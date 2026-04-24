@@ -347,55 +347,106 @@ async def extract_keywords_batch(
 
         total_scan_bytes = sum(s for _, _, s in scan_files)
 
-        # ─── Phase 2: Scan with ripgrep (per-keyword parallel) ─────
+        # ─── Phase 2: Scan with ripgrep (chunked across files, all keywords per pass) ─
 
-        file_paths = [str(fp) for _, fp, _ in scan_files]
+        # Build chunks of files balanced by total bytes so each rg worker reads
+        # roughly the same amount of data. One ripgrep per chunk scans for ALL
+        # keywords in a single pass — each file is read exactly once.
+        sorted_files = sorted(scan_files, key=lambda x: -x[2])  # largest first
+        num_chunks = max(1, min(SCAN_WORKERS, len(sorted_files)))
+        chunks: list[list[tuple[str, Path, int]]] = [[] for _ in range(num_chunks)]
+        chunk_bytes = [0] * num_chunks
+        for entry in sorted_files:
+            i = chunk_bytes.index(min(chunk_bytes))
+            chunks[i].append(entry)
+            chunk_bytes[i] += entry[2]
+
+        # Lowercase keywords once for cheap per-line attribution (rg uses -i).
+        kw_lower = [(kw, kw.lower()) for kw in deduped_keywords]
+
+        log.info(
+            "Scan: starting ripgrep across %d files (%s) in %d chunks for %d keyword(s)",
+            len(scan_files), _human_bytes(total_scan_bytes), num_chunks, len(deduped_keywords),
+        )
+
         sem = asyncio.Semaphore(SCAN_WORKERS)
-        done_keywords = 0
+        done_chunks = 0
+        done_bytes = 0
         lock = asyncio.Lock()
+        progress_state = {"last_log": 0.0, "last_msg": 0.0}
 
-        async def _scan_keyword(kw: str):
-            nonlocal done_keywords
+        async def _scan_chunk(idx: int, files: list[tuple[str, Path, int]]):
+            nonlocal done_chunks, done_bytes
+            if not files:
+                return
+            paths = [str(fp) for _, fp, _ in files]
+            chunk_size = sum(s for _, _, s in files)
+
+            # -e per keyword = match any. Single read of each file.
+            args = [
+                "rg", "-F", "-i",
+                "--no-heading", "--no-filename", "--no-line-number",
+                "--no-messages",
+            ]
+            for kw in deduped_keywords:
+                args.extend(["-e", kw])
+            args.append("--")
+            args.extend(paths)
+
             async with sem:
-                # One ripgrep across ALL files for this keyword
-                # -F = fixed string (faster than regex, no escaping needed)
+                t0 = asyncio.get_event_loop().time()
                 rg_result = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "rg", "-F", "-i",
-                        "--no-heading",
-                        "--no-filename",
-                        "--no-line-number",
-                        "--no-messages",
-                        "--",
-                        kw,
-                    ] + file_paths,
-                    capture_output=True,
+                    subprocess.run, args, capture_output=True,
                 )
+                elapsed = asyncio.get_event_loop().time() - t0
 
-                hits: set[str] = set()
-                for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
-                    cred = _extract_credential(raw_line.strip())
-                    if cred:
-                        hits.add(cred)
+            local_hits: dict[str, set[str]] = {kw: set() for kw, _ in kw_lower}
+            for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                low = stripped.lower()
+                cred = _extract_credential(stripped)
+                if not cred:
+                    continue
+                for kw, kwl in kw_lower:
+                    if kwl in low:
+                        local_hits[kw].add(cred)
 
-                async with lock:
-                    keyword_creds[kw] = hits
-                    done_keywords += 1
+            async with lock:
+                for kw, s in local_hits.items():
+                    keyword_creds[kw].update(s)
+                done_chunks += 1
+                done_bytes += chunk_size
 
-                    pct = int((done_keywords / max(1, len(deduped_keywords))) * 100)
+                now = asyncio.get_event_loop().time()
+                if now - progress_state["last_log"] >= 5 or done_chunks == num_chunks:
+                    progress_state["last_log"] = now
+                    log.info(
+                        "Scan progress: chunk %d/%d done in %.1fs (%s/%s, %d%%)",
+                        done_chunks, num_chunks, elapsed,
+                        _human_bytes(done_bytes), _human_bytes(total_scan_bytes),
+                        int(done_bytes / max(1, total_scan_bytes) * 100),
+                    )
+                if now - progress_state["last_msg"] >= 4 or done_chunks == num_chunks:
+                    progress_state["last_msg"] = now
+                    pct = int(done_bytes / max(1, total_scan_bytes) * 100)
                     kw_summary = " | ".join(
                         f"{k}: {len(keyword_creds[k])}" for k in deduped_keywords
                     )
-                    await _set_progress(
-                        f"🔎 **Scanning**\n"
-                        f"{_bar(pct)} {pct}%\n"
-                        f"Keywords: {done_keywords}/{len(deduped_keywords)}\n"
-                        f"Files: {len(scan_files)} ({_human_bytes(total_scan_bytes)}) | Workers: {SCAN_WORKERS}\n"
-                        f"{kw_summary}"
-                    )
+                    try:
+                        await _set_progress(
+                            f"🔎 **Scanning**\n"
+                            f"{_bar(pct)} {pct}%\n"
+                            f"Chunks: {done_chunks}/{num_chunks} | "
+                            f"{_human_bytes(done_bytes)}/{_human_bytes(total_scan_bytes)}\n"
+                            f"Files: {len(scan_files)} | Workers: {SCAN_WORKERS}\n"
+                            f"{kw_summary}"
+                        )
+                    except Exception:
+                        pass
 
-        await asyncio.gather(*[_scan_keyword(kw) for kw in deduped_keywords])
+        await asyncio.gather(*[_scan_chunk(i, c) for i, c in enumerate(chunks)])
 
         # Final scan progress
         kw_summary = " | ".join(
