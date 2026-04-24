@@ -349,63 +349,47 @@ async def extract_keywords_batch(
 
         # ─── Phase 2: Scan with ripgrep (chunked across files, all keywords per pass) ─
 
-        # Build many small chunks balanced by total bytes. Many chunks (≫ workers)
-        # gives smooth progress trickle; low concurrency (≤ ~8) avoids NVMe thrash
-        # since 64 parallel ripgreps all reading random offsets ruin throughput.
-        # One ripgrep per chunk scans for ALL keywords in a single pass — each
-        # file is read exactly once.
+        # Process files one-at-a-time per worker via a shared async queue.
+        # Workers pull the next file, run a single `rg` against it (all keywords
+        # in one pass), update shared progress, and grab the next. This gives
+        # smooth per-file progress and naturally load-balances huge files
+        # (one slow file ties up only one worker).
         sorted_files = sorted(scan_files, key=lambda x: -x[2])  # largest first
-        # Aim for ~1 GB per chunk so a typical 360 GB scan = ~360 progress ticks.
-        target_chunk_bytes = 1 * 1024 * 1024 * 1024
-        approx_chunks = max(1, total_scan_bytes // target_chunk_bytes)
-        num_chunks = max(1, min(int(approx_chunks), len(sorted_files)))
-        # Always have at least 4× the worker count so progress feels live.
-        num_chunks = max(num_chunks, min(SCAN_WORKERS * 4, len(sorted_files)))
 
-        chunks: list[list[tuple[str, Path, int]]] = [[] for _ in range(num_chunks)]
-        chunk_bytes = [0] * num_chunks
-        for entry in sorted_files:
-            i = chunk_bytes.index(min(chunk_bytes))
-            chunks[i].append(entry)
-            chunk_bytes[i] += entry[2]
-
-        # Lowercase keywords once for cheap per-line attribution (rg uses -i).
         kw_lower = [(kw, kw.lower()) for kw in deduped_keywords]
 
-        # Cap concurrency: too many parallel ripgreps thrash the disk and all
-        # finish in lockstep at the end (so progress jumps 0 → 100). Keep it low.
-        max_concurrent = max(1, min(8, SCAN_WORKERS, num_chunks))
+        # Keep concurrency low — Railway's volume is network-attached, not NVMe.
+        # Too many parallel rg processes will thrash and serialize on disk anyway.
+        max_concurrent = max(1, min(8, SCAN_WORKERS, len(sorted_files)))
+        total_files_to_scan = len(sorted_files)
 
         log.info(
-            "Scan: starting ripgrep across %d files (%s) in %d chunks, %d concurrent, for %d keyword(s)",
-            len(scan_files), _human_bytes(total_scan_bytes),
-            num_chunks, max_concurrent, len(deduped_keywords),
+            "Scan: starting ripgrep across %d files (%s), %d concurrent, for %d keyword(s)",
+            total_files_to_scan, _human_bytes(total_scan_bytes),
+            max_concurrent, len(deduped_keywords),
         )
 
-        # Send initial progress message IMMEDIATELY so the user sees activity
-        # before the first chunk completes (which may take many seconds).
+        # Initial Telegram message — so user sees activity before first file finishes.
         await _set_progress(
             f"🔎 **Scanning**\n"
             f"{_bar(0)} 0%\n"
-            f"Chunks: 0/{num_chunks} | 0 B/{_human_bytes(total_scan_bytes)}\n"
-            f"Files: {len(scan_files)} | Workers: {max_concurrent}\n"
+            f"Files: 0/{total_files_to_scan} | 0 B/{_human_bytes(total_scan_bytes)}\n"
+            f"Workers: {max_concurrent} | Starting…\n"
             + " | ".join(f"{kw}: 0" for kw in deduped_keywords)
         )
 
-        sem = asyncio.Semaphore(max_concurrent)
-        done_chunks = 0
+        queue: asyncio.Queue[tuple[str, Path, int]] = asyncio.Queue()
+        for entry in sorted_files:
+            queue.put_nowait(entry)
+
+        done_files = 0
         done_bytes = 0
-        lock = asyncio.Lock()
-        progress_state = {"last_log": 0.0, "last_msg": 0.0}
+        active: dict[int, tuple[str, int, float]] = {}  # worker_id -> (name, size, start_t)
+        state_lock = asyncio.Lock()
+        scan_t0 = asyncio.get_event_loop().time()
 
-        async def _scan_chunk(idx: int, files: list[tuple[str, Path, int]]):
-            nonlocal done_chunks, done_bytes
-            if not files:
-                return
-            paths = [str(fp) for _, fp, _ in files]
-            chunk_size = sum(s for _, _, s in files)
-
-            # -e per keyword = match any. Single read of each file.
+        async def _scan_one(file_id: str, fp: Path, size: int, worker_id: int):
+            nonlocal done_files, done_bytes
             args = [
                 "rg", "-F", "-i",
                 "--no-heading", "--no-filename", "--no-line-number",
@@ -413,15 +397,23 @@ async def extract_keywords_batch(
             ]
             for kw in deduped_keywords:
                 args.extend(["-e", kw])
-            args.append("--")
-            args.extend(paths)
+            args.extend(["--", str(fp)])
 
-            async with sem:
-                t0 = asyncio.get_event_loop().time()
+            t0 = asyncio.get_event_loop().time()
+            async with state_lock:
+                active[worker_id] = (fp.name, size, t0)
+
+            try:
                 rg_result = await asyncio.to_thread(
                     subprocess.run, args, capture_output=True,
                 )
-                elapsed = asyncio.get_event_loop().time() - t0
+            except Exception as e:
+                log.warning("Scan: rg failed on %s: %s", fp, e)
+                async with state_lock:
+                    active.pop(worker_id, None)
+                    done_files += 1
+                    done_bytes += size
+                return
 
             local_hits: dict[str, set[str]] = {kw: set() for kw, _ in kw_lower}
             for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
@@ -436,40 +428,76 @@ async def extract_keywords_batch(
                     if kwl in low:
                         local_hits[kw].add(cred)
 
-            async with lock:
+            async with state_lock:
                 for kw, s in local_hits.items():
                     keyword_creds[kw].update(s)
-                done_chunks += 1
-                done_bytes += chunk_size
+                active.pop(worker_id, None)
+                done_files += 1
+                done_bytes += size
 
-                now = asyncio.get_event_loop().time()
-                if now - progress_state["last_log"] >= 5 or done_chunks == num_chunks:
-                    progress_state["last_log"] = now
-                    log.info(
-                        "Scan progress: chunk %d/%d done in %.1fs (%s/%s, %d%%)",
-                        done_chunks, num_chunks, elapsed,
-                        _human_bytes(done_bytes), _human_bytes(total_scan_bytes),
-                        int(done_bytes / max(1, total_scan_bytes) * 100),
-                    )
-                if now - progress_state["last_msg"] >= 4 or done_chunks == num_chunks:
-                    progress_state["last_msg"] = now
-                    pct = int(done_bytes / max(1, total_scan_bytes) * 100)
-                    kw_summary = " | ".join(
-                        f"{k}: {len(keyword_creds[k])}" for k in deduped_keywords
-                    )
-                    try:
-                        await _set_progress(
-                            f"🔎 **Scanning**\n"
-                            f"{_bar(pct)} {pct}%\n"
-                            f"Chunks: {done_chunks}/{num_chunks} | "
-                            f"{_human_bytes(done_bytes)}/{_human_bytes(total_scan_bytes)}\n"
-                            f"Files: {len(scan_files)} | Workers: {max_concurrent}\n"
-                            f"{kw_summary}"
-                        )
-                    except Exception:
-                        pass
+        async def _worker(worker_id: int):
+            while True:
+                try:
+                    entry = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await _scan_one(*entry, worker_id=worker_id)
+                finally:
+                    queue.task_done()
 
-        await asyncio.gather(*[_scan_chunk(i, c) for i, c in enumerate(chunks)])
+        async def _heartbeat():
+            """Periodic progress reporter that runs even while files are still scanning."""
+            while True:
+                await asyncio.sleep(5)
+                async with state_lock:
+                    df = done_files
+                    db = done_bytes
+                    snapshot = list(active.items())
+                    kw_counts = {kw: len(keyword_creds[kw]) for kw in deduped_keywords}
+
+                pct = int(db / max(1, total_scan_bytes) * 100)
+                elapsed = asyncio.get_event_loop().time() - scan_t0
+                rate = db / max(1.0, elapsed)
+                eta = int((total_scan_bytes - db) / rate) if rate > 0 else 0
+
+                # Log: include in-flight files so we can see what's slow.
+                if snapshot:
+                    inflight = ", ".join(
+                        f"{name}({_human_bytes(sz)},{int(asyncio.get_event_loop().time() - st)}s)"
+                        for _, (name, sz, st) in snapshot[:3]
+                    )
+                else:
+                    inflight = "(none)"
+                log.info(
+                    "Scan progress: %d/%d files (%s/%s, %d%%) | %.1f MB/s | ETA %ds | active: %s",
+                    df, total_files_to_scan, _human_bytes(db), _human_bytes(total_scan_bytes),
+                    pct, rate / (1024 * 1024), eta, inflight,
+                )
+
+                kw_summary = " | ".join(f"{k}: {v}" for k, v in kw_counts.items())
+                try:
+                    await _set_progress(
+                        f"🔎 **Scanning**\n"
+                        f"{_bar(pct)} {pct}%\n"
+                        f"Files: {df}/{total_files_to_scan} | "
+                        f"{_human_bytes(db)}/{_human_bytes(total_scan_bytes)}\n"
+                        f"Speed: {rate / (1024 * 1024):.1f} MB/s | ETA: {eta}s\n"
+                        f"Active workers: {len(snapshot)}/{max_concurrent}\n"
+                        f"{kw_summary}"
+                    )
+                except Exception:
+                    pass
+
+        hb_task = asyncio.create_task(_heartbeat())
+        try:
+            await asyncio.gather(*[_worker(i) for i in range(max_concurrent)])
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Final scan progress
         kw_summary = " | ".join(
@@ -478,8 +506,8 @@ async def extract_keywords_batch(
         await _set_progress(
             f"🔎 **Scanning**\n"
             f"{_bar(100)} 100%\n"
-            f"Keywords: {len(deduped_keywords)}/{len(deduped_keywords)}\n"
-            f"Completed all {len(scan_files)} files ({_human_bytes(total_scan_bytes)})\n"
+            f"Files: {total_files_to_scan}/{total_files_to_scan}\n"
+            f"Completed ({_human_bytes(total_scan_bytes)})\n"
             f"{kw_summary}"
         )
 
