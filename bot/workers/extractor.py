@@ -354,13 +354,18 @@ async def extract_keywords_batch(
         # in one pass), update shared progress, and grab the next. This gives
         # smooth per-file progress and naturally load-balances huge files
         # (one slow file ties up only one worker).
-        sorted_files = sorted(scan_files, key=lambda x: -x[2])  # largest first
+        # Smallest first: thousands of small files complete quickly so the
+        # progress bar moves immediately. The few huge files run last/in parallel.
+        sorted_files = sorted(scan_files, key=lambda x: x[2])  # smallest first
 
         kw_lower = [(kw, kw.lower()) for kw in deduped_keywords]
 
-        # Keep concurrency low — Railway's volume is network-attached, not NVMe.
-        # Too many parallel rg processes will thrash and serialize on disk anyway.
-        max_concurrent = max(1, min(8, SCAN_WORKERS, len(sorted_files)))
+        # Railway gives ~2 vCPU. ripgrep is CPU-bound on text scanning, so more
+        # than ~2 parallel rg processes just thrash and slow each other down.
+        # Also: previous capture_output=True OOM'd at 8 workers × ~2.5 GB stdout
+        # buffer = 20 GB → container killed. Now we stream stdout, but keep
+        # concurrency low to match available CPU.
+        max_concurrent = max(1, min(2, SCAN_WORKERS, len(sorted_files)))
         total_files_to_scan = len(sorted_files)
 
         log.info(
@@ -403,30 +408,55 @@ async def extract_keywords_batch(
             async with state_lock:
                 active[worker_id] = (fp.name, size, t0)
 
+            local_hits: dict[str, set[str]] = {kw: set() for kw, _ in kw_lower}
+
+            def _run_and_parse() -> None:
+                """
+                Run rg, stream stdout line-by-line so memory stays bounded
+                regardless of how many matches a giant file produces. Without
+                this, rg's stdout for a 4 GB dump where most lines match would
+                buffer GBs in RAM → OOM kill of the worker container.
+                """
+                try:
+                    proc = subprocess.Popen(
+                        args,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        bufsize=1024 * 1024,
+                    )
+                except Exception as e:
+                    log.warning("Scan: rg spawn failed on %s: %s", fp, e)
+                    return
+                assert proc.stdout is not None
+                try:
+                    for raw in proc.stdout:
+                        try:
+                            stripped = raw.decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            continue
+                        if not stripped:
+                            continue
+                        cred = _extract_credential(stripped)
+                        if not cred:
+                            continue
+                        low = stripped.lower()
+                        for kw, kwl in kw_lower:
+                            if kwl in low:
+                                local_hits[kw].add(cred)
+                finally:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+
             try:
-                rg_result = await asyncio.to_thread(
-                    subprocess.run, args, capture_output=True,
-                )
+                await asyncio.to_thread(_run_and_parse)
             except Exception as e:
                 log.warning("Scan: rg failed on %s: %s", fp, e)
-                async with state_lock:
-                    active.pop(worker_id, None)
-                    done_files += 1
-                    done_bytes += size
-                return
-
-            local_hits: dict[str, set[str]] = {kw: set() for kw, _ in kw_lower}
-            for raw_line in rg_result.stdout.decode(errors="replace").splitlines():
-                stripped = raw_line.strip()
-                if not stripped:
-                    continue
-                low = stripped.lower()
-                cred = _extract_credential(stripped)
-                if not cred:
-                    continue
-                for kw, kwl in kw_lower:
-                    if kwl in low:
-                        local_hits[kw].add(cred)
 
             async with state_lock:
                 for kw, s in local_hits.items():
