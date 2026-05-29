@@ -54,3 +54,11 @@ ARQ_MAX_JOBS: int = int(os.environ.get("ARQ_MAX_JOBS", "50"))
 
 # --- Scan workers (parallel ripgrep processes) ---
 SCAN_WORKERS: int = int(os.environ.get("SCAN_WORKERS", "64"))
+
+# --- Multi-worker scaling ---
+# WORKER_ID=0 → bot service (polls Telegram + light ARQ worker on arq:w0)
+# WORKER_ID=1..N → dedicated download workers (own Pyrogram session, queue arq:wN)
+WORKER_ID: int = int(os.environ.get("WORKER_ID", "0"))
+# WORKER_COUNT=0 → single-service mode (all jobs go to arq:w0)
+# WORKER_COUNT=N → N dedicated workers; downloads round-robined to arq:w1..arq:wN
+WORKER_COUNT: int = int(os.environ.get("WORKER_COUNT", "0"))
