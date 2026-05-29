@@ -98,6 +98,19 @@ async def main():
     except Exception:
         log.exception("Failed to flush stale ARQ jobs")
 
+    # ── Reset stuck DOWNLOADING files ──
+    # If the bot crashed mid-download the File row stays as DOWNLOADING but
+    # the ARQ job no longer exists.  Mark them ERROR so duplicate-detection
+    # doesn't block the user from re-sending the same file after a restart.
+    try:
+        from bot.db import crud
+        from bot.db.models import FileStatus
+        reset_count = await crud.reset_stuck_downloads()
+        if reset_count:
+            log.info("Reset %d stuck DOWNLOADING file(s) to ERROR on startup", reset_count)
+    except Exception:
+        log.exception("Failed to reset stuck downloads")
+
     # ── Clean Pyrogram session files ──
     # Delete ALL session-related files (session + SQLite journal/wal/shm)
     # to prevent corrupted auth_key / msg_id reconnect loops.
