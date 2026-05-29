@@ -3,7 +3,7 @@
 from arq import create_pool
 from arq.connections import RedisSettings, ArqRedis
 
-from bot.config import REDIS_URL, ARQ_MAX_JOBS
+from bot.config import REDIS_URL, ARQ_MAX_JOBS, WORKER_ID, WORKER_COUNT
 
 _pool: ArqRedis | None = None
 
@@ -28,9 +28,40 @@ async def get_pool() -> ArqRedis:
     return _pool
 
 
-async def enqueue(func_name: str, **kwargs) -> None:
+def worker_queue(worker_id: int) -> str:
+    """Return the ARQ queue name for a given worker ID."""
+    return f"arq:w{worker_id}"
+
+
+async def get_next_worker_queue() -> str:
+    """Round-robin across WORKER_COUNT dedicated workers.
+
+    Falls back to arq:w0 in single-service mode (WORKER_COUNT=0).
+    Uses Redis INCR as an atomic counter so multiple bot instances agree.
+    """
+    if WORKER_COUNT <= 0:
+        return worker_queue(0)
     pool = await get_pool()
-    await pool.enqueue_job(func_name, **kwargs)
+    idx = await pool.incr("worker:rr_counter")
+    wid = ((int(idx) - 1) % WORKER_COUNT) + 1
+    return worker_queue(wid)
+
+
+async def enqueue(func_name: str, *, _queue: str | None = None, **kwargs) -> None:
+    """Enqueue a job to a specific queue (defaults to arq:w0)."""
+    pool = await get_pool()
+    q = _queue or worker_queue(0)
+    await pool.enqueue_job(func_name, **kwargs, _queue_name=q)
+
+
+async def enqueue_round_robin(func_name: str, **kwargs) -> str:
+    """Enqueue a download job to the next worker in rotation.
+
+    Returns the queue name used so the caller can stamp worker_id if needed.
+    """
+    q = await get_next_worker_queue()
+    await enqueue(func_name, _queue=q, **kwargs)
+    return q
 
 
 async def abort_all_queued() -> int:
@@ -66,5 +97,8 @@ class WorkerSettings:
     ]
     redis_settings = _parse_redis_url(REDIS_URL)
     max_jobs = ARQ_MAX_JOBS
-    job_timeout = 7200  # 2 hours per job max
+    job_timeout = 7200
     health_check_interval = 30
+    # Each worker listens exclusively to its own queue.
+    # Bot service: arq:w0  |  Worker N: arq:wN
+    queue_name = worker_queue(WORKER_ID)
