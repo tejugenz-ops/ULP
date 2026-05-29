@@ -384,9 +384,12 @@ async def on_document(_, message: Message):
             if sent:
                 _file_button_msg[message.from_user.id] = sent.id
     else:
-        # Non-guided: full progress + completion message
-        status_msg = await _safe_reply(message, "⬇️ **Downloading file from Telegram...**")
-        status_message_id = status_msg.id if status_msg else 0
+        # Non-guided: one silent acknowledgment per file, no per-file progress/completion
+        # messages. This prevents FloodWait when many files are sent at once.
+        await _safe_reply(
+            message,
+            f"📥 Queued: **{original_name}**\nUse /status to track · /files to list all.",
+        )
         await enqueue(
             "download_telegram_file",
             user_id=message.from_user.id,
@@ -395,7 +398,8 @@ async def on_document(_, message: Message):
             original_name=original_name,
             job_id=str(job.id),
             chat_id=message.chat.id,
-            status_message_id=status_message_id,
+            status_message_id=0,
+            silent=True,
         )
 
 
