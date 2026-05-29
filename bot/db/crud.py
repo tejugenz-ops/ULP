@@ -131,6 +131,21 @@ async def list_all_ready_files() -> list[File]:
         return list(result.scalars().all())
 
 
+async def get_files_grouped_by_worker(file_ids: list[_ID]) -> dict[int, list[str]]:
+    """Return {worker_id: [file_id_str, ...]} for the given file IDs.
+
+    Used by /scan and guided keyword submission to fan out scan jobs to the
+    worker that holds each file locally, so scanning always reads from disk.
+    Files with no worker_id set (legacy rows) are grouped under worker 0.
+    """
+    files = await get_files_bulk(file_ids)
+    groups: dict[int, list[str]] = {}
+    for f in files:
+        wid = f.worker_id if f.worker_id is not None else 0
+        groups.setdefault(wid, []).append(str(f.id))
+    return groups
+
+
 async def list_unextracted_archives(extensions: set[str]) -> list[File]:
     """Return READY files whose names end with an archive extension and have no children."""
     from sqlalchemy import exists, or_
