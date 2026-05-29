@@ -86,15 +86,23 @@ async def main():
     # and flood Telegram API calls before the session is stable.
     try:
         from bot.workers._arq import get_pool
+        from bot.config import WORKER_COUNT
         pool = await get_pool()
         stale_keys = await pool.keys("arq:job:*")
         if stale_keys:
             await pool.delete(*stale_keys)
-        queue_len = await pool.zcard(b"arq:queue")
-        if queue_len:
-            await pool.delete(b"arq:queue")
+        # Flush all worker queues (arq:w0 .. arq:wN) plus old arq:queue
+        queues_to_flush = [b"arq:queue", b"arq:w0"]
+        for wid in range(1, (WORKER_COUNT or 0) + 1):
+            queues_to_flush.append(f"arq:w{wid}".encode())
+        flushed = 0
+        for q in queues_to_flush:
+            n = await pool.zcard(q)
+            if n:
+                await pool.delete(q)
+                flushed += n
         log.info("Flushed %d stale ARQ job key(s) and %d queued job(s)",
-                 len(stale_keys), queue_len)
+                 len(stale_keys), flushed)
     except Exception:
         log.exception("Failed to flush stale ARQ jobs")
 
