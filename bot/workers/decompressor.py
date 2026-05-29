@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.config import WORKER_ID
 from bot.db import crud
 from bot.db.models import FileStatus, JobStatus, JobType
 from bot.storage import bucket, local
@@ -160,6 +161,7 @@ async def extract_archive(
                 child.id,
                 status=FileStatus.READY,
                 local_path=str(child_path),
+                worker_id=WORKER_ID,
             )
 
             # Upload to bucket in background
