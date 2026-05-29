@@ -87,6 +87,9 @@ class File(Base):
         UUID(as_uuid=True), ForeignKey("files.id")
     )
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Which ARQ worker downloaded this file (0 = bot service, 1..N = dedicated workers).
+    # Used to route scan jobs back to the owning worker so scans always read from local disk.
+    worker_id: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -148,5 +151,10 @@ async def init_db() -> None:
             __import__("sqlalchemy").text(
                 "CREATE INDEX IF NOT EXISTS ix_files_tg_unique_id"
                 " ON files (telegram_file_unique_id)"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE files ADD COLUMN IF NOT EXISTS worker_id INTEGER NOT NULL DEFAULT 0"
             )
         )
