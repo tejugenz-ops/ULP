@@ -696,14 +696,6 @@ async def cmd_done(_, message: Message):
         return await message.reply("⛔ You are not authorized.")
 
     uid = message.from_user.id
-
-    # Toggle off if already running
-    existing = _live_tasks.get(uid)
-    if existing and not existing.done():
-        existing.cancel()
-        _live_tasks.pop(uid, None)
-        return await _safe_reply(message, "⏹ Live progress stopped.")
-
     session = _download_session.get(uid)
     if not session or not session["file_ids"]:
         return await _safe_reply(
