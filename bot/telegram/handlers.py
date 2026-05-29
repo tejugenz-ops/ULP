@@ -67,6 +67,10 @@ _collect_state: dict[int, dict] = {}  # user_id → {items: [{msg_id, file_id, n
 # user_id → {file_ids: [str], total_size: int}
 _download_session: dict[int, dict] = {}
 
+# ── Live /done progress tasks ──
+# user_id → running asyncio.Task (editing the progress message every 3s)
+_live_tasks: dict[int, asyncio.Task] = {}
+
 
 def _reset_collect(user_id: int):
     st = _collect_state.pop(user_id, None)
@@ -627,7 +631,63 @@ async def cmd_status(_, message: Message):
     await _safe_reply(message, "\n".join(lines))
 
 
-# ── /done — Show silent download session progress ────────────────────
+# ── /done — Live download session progress (updates every 3s) ────────
+
+_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def _fmt_size(b: int) -> str:
+    if b >= 1024 ** 3:
+        return f"{b / 1024 ** 3:.1f} GB"
+    if b >= 1024 ** 2:
+        return f"{b / 1024 ** 2:.1f} MB"
+    return f"{b / 1024:.1f} KB"
+
+
+def _progress_bar(done: int, total: int, width: int = 16) -> str:
+    if total == 0:
+        return "░" * width
+    filled = round(width * done / total)
+    return "█" * filled + "░" * (width - filled)
+
+
+async def _build_progress_text(uid: int, spin_idx: int) -> tuple[str, bool]:
+    """Return (message_text, is_complete)."""
+    session = _download_session.get(uid)
+    if not session or not session["file_ids"]:
+        return "📭 No active download session.", True
+
+    file_ids = session["file_ids"]
+    total_count = len(file_ids)
+    total_size = session["total_size"]
+
+    files = await crud.get_files_bulk(file_ids)
+    done_count = sum(1 for f in files if f.status.value == "ready")
+    done_size = sum(f.size_bytes or 0 for f in files if f.status.value == "ready")
+    error_count = sum(1 for f in files if f.status.value == "error")
+    in_progress = total_count - done_count - error_count
+
+    complete = in_progress == 0 and error_count == 0
+    spinner = "✅" if complete else _SPINNER[spin_idx % len(_SPINNER)]
+
+    file_bar = _progress_bar(done_count, total_count)
+    size_bar = _progress_bar(done_size, total_size if total_size else 1)
+
+    lines = [
+        f"📊 **Download Session** {spinner}\n",
+        f"📁 `{file_bar}` **{done_count}/{total_count}** files",
+        f"💾 `{size_bar}` **{_fmt_size(done_size)} / {_fmt_size(total_size)}**",
+    ]
+    if in_progress > 0:
+        lines.append(f"\n⬇️ Downloading: {in_progress} file(s)")
+    if error_count:
+        lines.append(f"❌ Failed: {error_count} file(s)")
+    if complete:
+        lines.append(f"\n🎉 All {total_count} file(s) downloaded!")
+    else:
+        lines.append(f"\n_Updates every 3s · /done to stop_")
+
+    return "\n".join(lines), complete
 
 
 @app.on_message(filters.command("done") & filters.private)
@@ -636,45 +696,50 @@ async def cmd_done(_, message: Message):
         return await message.reply("⛔ You are not authorized.")
 
     uid = message.from_user.id
+
+    # Toggle off if already running
+    existing = _live_tasks.get(uid)
+    if existing and not existing.done():
+        existing.cancel()
+        _live_tasks.pop(uid, None)
+        return await _safe_reply(message, "⏹ Live progress stopped.")
+
     session = _download_session.get(uid)
     if not session or not session["file_ids"]:
         return await _safe_reply(
             message,
-            "📭 No active download session.\nJust drop files here and I'll download them silently, then use /done to check progress.",
+            "📭 No active download session.\nJust drop files here — I'll download silently. Use /done to watch live progress.",
         )
 
-    file_ids = session["file_ids"]
-    total_count = len(file_ids)
-    total_size_bytes = session["total_size"]
-
-    files = await crud.get_files_bulk(file_ids)
-
-    downloaded_count = sum(1 for f in files if f.status.value == "ready")
-    downloaded_size = sum(f.size_bytes or 0 for f in files if f.status.value == "ready")
-    error_count = sum(1 for f in files if f.status.value == "error")
-    in_progress = total_count - downloaded_count - error_count
-
-    def _fmt(b: int) -> str:
-        if b >= 1024 ** 3:
-            return f"{b / 1024 ** 3:.1f} GB"
-        if b >= 1024 ** 2:
-            return f"{b / 1024 ** 2:.1f} MB"
-        return f"{b / 1024:.1f} KB"
-
-    lines = [
-        "📊 **Download Session**\n",
-        f"📁 Files:  **{downloaded_count}/{total_count}** downloaded",
-        f"💾 Size:   **{_fmt(downloaded_size)} / {_fmt(total_size_bytes)}**",
-    ]
-    if in_progress > 0:
-        lines.append(f"⬇️ In progress: {in_progress} file(s)")
-    if error_count:
-        lines.append(f"❌ Failed: {error_count} file(s)")
-    if in_progress == 0 and error_count == 0:
-        lines.append(f"\n✅ All {total_count} file(s) downloaded!")
+    # Send initial message then kick off live updater
+    initial_text, complete = await _build_progress_text(uid, 0)
+    sent = await _safe_reply(message, initial_text)
+    if not sent:
+        return
+    if complete:
         _download_session.pop(uid, None)
+        return
 
-    await _safe_reply(message, "\n".join(lines))
+    async def _live_updater(msg, user_id: int):
+        spin = 1
+        # Max 30 minutes of live updates
+        for _ in range(600):
+            await asyncio.sleep(3)
+            try:
+                text, done = await _build_progress_text(user_id, spin)
+                await msg.edit_text(text)
+                spin += 1
+                if done:
+                    _download_session.pop(user_id, None)
+                    break
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+        _live_tasks.pop(user_id, None)
+
+    task = asyncio.create_task(_live_updater(sent, uid))
+    _live_tasks[uid] = task
 
 
 # ── /cancel <job_id> ─────────────────────────────────────────────────
