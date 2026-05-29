@@ -128,15 +128,15 @@ async def main():
         Path(f).unlink(missing_ok=True)
         log.info("Removed session file: %s", f)
 
-    # ── Start Pyrogram (with outer retry) ──
+    # ── Start Pyrogram (retry loop that handles FloodWait) ──
     log.info("Starting Telegram bot...")
-    max_outer = 3
-    for outer in range(1, max_outer + 1):
+    while True:
         try:
             await tg_app.start()
             break
-        except (ConnectionError, OSError, Exception) as exc:
-            log.error("tg_app.start() attempt %d/%d failed: %s", outer, max_outer, exc)
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            flood_secs = getattr(exc, "value", None)
             try:
                 await tg_app.stop()
             except Exception:
@@ -144,12 +144,16 @@ async def main():
             # Re-clean session files before next attempt
             for f in glob.glob(session_base + "*"):
                 Path(f).unlink(missing_ok=True)
-            if outer < max_outer:
-                wait = 30 * outer
-                log.info("Waiting %ds before next start attempt…", wait)
+            if flood_secs and "FloodWait" in exc_name:
+                wait = int(flood_secs) + 10
+                log.warning(
+                    "FloodWait %ds from Telegram — sleeping inside process "
+                    "(will not crash, Railway will not restart us)...", wait,
+                )
                 await asyncio.sleep(wait)
             else:
-                raise
+                log.error("tg_app.start() failed (%s: %s), retrying in 60s...", exc_name, exc)
+                await asyncio.sleep(60)
 
     me = await tg_app.get_me()
     log.info("Bot authenticated as @%s (id=%s)", me.username, me.id)
