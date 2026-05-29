@@ -9,22 +9,20 @@ restartPolicyMaxRetries = 5
 
 # ── Multi-worker scaling ──────────────────────────────────────────────
 #
-# This file defines the BOT service (WORKER_ID=0).
-# Each dedicated download worker is a SEPARATE Railway service using the
-# same Docker image but a different start command:
+# All shared env vars (DATABASE_URL, REDIS_URL, TELEGRAM_*, WORKER_COUNT,
+# ARQ_MAX_JOBS, MAX_CONCURRENT_TRANSMISSIONS, TG_DOWNLOAD_WORKERS) are now
+# hardcoded as defaults in bot/config.py.
 #
-#   Start command: python -m bot.worker_main
+# When creating a new worker service in Railway you only need to set ONE
+# environment variable manually:
 #
-# Required env vars per worker service (set in Railway dashboard):
-#   WORKER_ID=1          (unique per worker: 1, 2, 3, ... 10)
-#   WORKER_COUNT=10      (same value on ALL services including bot)
-#   TELEGRAM_BOT_TOKEN   (same as bot service)
-#   TELEGRAM_API_ID      (same as bot service)
-#   TELEGRAM_API_HASH    (same as bot service)
-#   DATABASE_URL         (shared PostgreSQL)
-#   REDIS_URL            (shared Redis)
-#   DATA_DIR=/data       (each worker gets its own mounted volume)
+#   WORKER_ID=<N>   ← unique per service: 0 = bot, 1-10 = download workers
+#
+# Start command for dedicated download workers (WORKER_ID >= 1):
+#   python -m bot.worker_main
+#
+# The bot service (WORKER_ID=0) uses the default start command in the Dockerfile.
 #
 # Volume: attach a Railway volume at /data to EACH worker service.
-# Each worker writes session + downloaded files to its own volume.
-# Scans are always local (worker only scans files it downloaded).
+# Each worker writes its Pyrogram session + downloaded files to its own volume.
+# Scans are always local (a worker only scans files it downloaded).
