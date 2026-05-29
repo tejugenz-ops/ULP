@@ -309,6 +309,19 @@ async def count_job_statuses(job_ids: list[str]) -> dict[str, int]:
         return {row[0].value: int(row[1]) for row in rows}
 
 
+async def reset_stuck_downloads() -> int:
+    """Reset files stuck in DOWNLOADING to ERROR on startup (bot crashed mid-download).
+    Returns count of files reset."""
+    async with _session() as s:
+        result = await s.execute(
+            update(File)
+            .where(File.status == FileStatus.DOWNLOADING)
+            .values(status=FileStatus.ERROR, error_message="Interrupted by bot restart — re-send to download again")
+        )
+        await s.commit()
+        return result.rowcount
+
+
 async def cancel_all_jobs() -> int:
     """Cancel ALL active jobs across all users. Returns count."""
     async with _session() as s:
