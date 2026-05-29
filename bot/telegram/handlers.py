@@ -271,10 +271,10 @@ async def cmd_download(_, message: Message):
     status_msg = await _safe_reply(message, "⬇️ **Starting URL download...")
     status_message_id = status_msg.id if status_msg else 0
 
-    # Enqueue download job via ARQ
-    from bot.workers._arq import enqueue
+    # Enqueue download job via ARQ — round-robin across workers
+    from bot.workers._arq import enqueue_round_robin
 
-    await enqueue(
+    await enqueue_round_robin(
         "download_url",
         user_id=message.from_user.id,
         file_id=str(file_record.id),
@@ -348,11 +348,11 @@ async def on_document(_, message: Message):
     session = guided_sessions.get(message.from_user.id)
     in_guided = session and session.state in {"waiting_files", "waiting_confirm"}
 
-    from bot.workers._arq import enqueue
+    from bot.workers._arq import enqueue_round_robin
 
     if in_guided:
         # Silent download: no progress messages, no completion message
-        await enqueue(
+        await enqueue_round_robin(
             "download_telegram_file",
             user_id=message.from_user.id,
             file_id=str(file_record.id),
@@ -401,7 +401,7 @@ async def on_document(_, message: Message):
         _download_session[uid]["file_ids"].append(str(file_record.id))
         _download_session[uid]["total_size"] += doc.file_size or 0
 
-        await enqueue(
+        await enqueue_round_robin(
             "download_telegram_file",
             user_id=uid,
             file_id=str(file_record.id),
@@ -470,10 +470,13 @@ async def cmd_search(_, message: Message):
     status_msg = await _safe_reply(message, f"\U0001f50d Searching for `{pattern}`...\nProgress: 0%")
     status_message_id = status_msg.id if status_msg else 0
 
-    from bot.workers._arq import enqueue
+    from bot.workers._arq import enqueue, worker_queue
 
+    # Route search to the worker that holds this file locally (fast path, no R2 pull)
+    wid = (file_record.worker_id or 0) if file_record.worker_id is not None else 0
     await enqueue(
         "search_file",
+        _queue=worker_queue(wid),
         user_id=message.from_user.id,
         file_id=file_id,
         pattern=pattern,
@@ -848,7 +851,7 @@ async def cmd_batch_download(_, message: Message):
     )
     status_message_id = status_msg.id if status_msg else 0
 
-    from bot.workers._arq import enqueue
+    from bot.workers._arq import enqueue_round_robin
 
     job_map: list[dict] = []  # [{job_id, name, telegram_file_id}]
 
@@ -869,7 +872,7 @@ async def cmd_batch_download(_, message: Message):
             "name": name,
             "telegram_file_id": tg_fid,
         })
-        await enqueue(
+        await enqueue_round_robin(
             "download_telegram_file",
             user_id=message.from_user.id,
             file_id=str(file_record.id),
@@ -1044,7 +1047,7 @@ async def on_collect_action(_, callback: CallbackQuery):
         f"✅ **{count}** file(s) collected. Starting batch download..."
     )
 
-    from bot.workers._arq import enqueue
+    from bot.workers._arq import enqueue_round_robin
 
     job_map: list[dict] = []
     for item in items:
@@ -1067,7 +1070,7 @@ async def on_collect_action(_, callback: CallbackQuery):
             "file_id": str(file_record.id),
             "name": name,
         })
-        await enqueue(
+        await enqueue_round_robin(
             "download_telegram_file",
             user_id=uid,
             file_id=str(file_record.id),
@@ -1173,9 +1176,14 @@ async def on_guided_keywords(_, message: Message):
 
             await message.reply(f"🔑 Retrying extraction with password...")
 
-            from bot.workers._arq import enqueue
+            from bot.workers._arq import enqueue, worker_queue
+
+            # Route extract_archive to the worker that holds the file locally
+            pw_file = await crud.get_file(pw_file_id)
+            pw_wid = (pw_file.worker_id or 0) if pw_file and pw_file.worker_id is not None else 0
             await enqueue(
                 "extract_archive",
+                _queue=worker_queue(pw_wid),
                 user_id=info["user_id"],
                 file_id=pw_file_id,
                 password=password,
@@ -1217,33 +1225,44 @@ async def on_guided_keywords(_, message: Message):
         mode = session.mode or "ulp"
         mode_label = mode.upper()
 
-        primary_file_id = session.file_ids[0] if session.file_ids else None
-        # Use existing enum value to avoid runtime failure when DB enum schema wasn't migrated.
-        job = await crud.create_job(
-            user_id=user_id,
-            job_type=JobType.SEARCH,
-            file_id=primary_file_id,
-        )
+        # Fan out scan jobs per worker — each worker scans only its own local files,
+        # so ripgrep always reads from disk (fast, no R2 pull needed).
+        grouped = await crud.get_files_grouped_by_worker(session.file_ids)
+        worker_count = len(grouped)
 
         status_msg = await _safe_reply(
             message,
-            f"\U0001f680 Starting {mode_label} extraction for {len(keywords)} keyword(s) across {len(session.file_ids)} file(s)...\n"
-            "Progress: 0%"
+            f"\U0001f680 Starting {mode_label} extraction for {len(keywords)} keyword(s) "
+            f"across {len(session.file_ids)} file(s)"
+            + (f" across {worker_count} worker(s)..." if worker_count > 1 else "...")
+            + "\nProgress: 0%"
         )
         status_message_id = status_msg.id if status_msg else 0
 
-        from bot.workers._arq import enqueue
+        from bot.workers._arq import enqueue, worker_queue
 
-        await enqueue(
-            "extract_keywords_batch",
-            user_id=user_id,
-            file_ids=session.file_ids,
-            keywords=keywords,
-            job_id=str(job.id),
-            chat_id=message.chat.id,
-            status_message_id=status_message_id,
-            mode=mode,
-        )
+        first_job = True
+        for wid, wfile_ids in grouped.items():
+            primary_file_id = wfile_ids[0] if wfile_ids else None
+            job = await crud.create_job(
+                user_id=user_id,
+                job_type=JobType.SEARCH,
+                file_id=primary_file_id,
+            )
+            # Only the first worker gets the shared status message to avoid conflicting edits.
+            smid = status_message_id if first_job else 0
+            first_job = False
+            await enqueue(
+                "extract_keywords_batch",
+                _queue=worker_queue(wid),
+                user_id=user_id,
+                file_ids=wfile_ids,
+                keywords=keywords,
+                job_id=str(job.id),
+                chat_id=message.chat.id,
+                status_message_id=smid,
+                mode=mode,
+            )
 
         # Reset for next /start flow.
         guided_sessions[user_id] = GuidedSession()
