@@ -62,6 +62,11 @@ _file_button_msg: dict[int, int] = {}  # user_id → message_id
 # ── Collection mode state ──
 _collect_state: dict[int, dict] = {}  # user_id → {items: [{msg_id, file_id, name}], timer, asked}
 
+# ── Silent download session (non-guided drops) ──
+# Accumulates across multiple sends until the user explicitly clears it.
+# user_id → {file_ids: [str], total_size: int}
+_download_session: dict[int, dict] = {}
+
 
 def _reset_collect(user_id: int):
     st = _collect_state.pop(user_id, None)
@@ -384,15 +389,17 @@ async def on_document(_, message: Message):
             if sent:
                 _file_button_msg[message.from_user.id] = sent.id
     else:
-        # Non-guided: one silent acknowledgment per file, no per-file progress/completion
-        # messages. This prevents FloodWait when many files are sent at once.
-        await _safe_reply(
-            message,
-            f"📥 Queued: **{original_name}**\nUse /status to track · /files to list all.",
-        )
+        # Non-guided: fully silent — no messages at all.
+        # File is tracked in _download_session; user runs /done to see progress.
+        uid = message.from_user.id
+        if uid not in _download_session:
+            _download_session[uid] = {"file_ids": [], "total_size": 0}
+        _download_session[uid]["file_ids"].append(str(file_record.id))
+        _download_session[uid]["total_size"] += doc.file_size or 0
+
         await enqueue(
             "download_telegram_file",
-            user_id=message.from_user.id,
+            user_id=uid,
             file_id=str(file_record.id),
             telegram_file_id=doc.file_id,
             original_name=original_name,
@@ -616,6 +623,56 @@ async def cmd_status(_, message: Message):
         for j in running:
             pct = f" — {j.progress}%" if j.progress else ""
             lines.append(f"🔄 `{j.job_type.value}`{pct}")
+
+    await _safe_reply(message, "\n".join(lines))
+
+
+# ── /done — Show silent download session progress ────────────────────
+
+
+@app.on_message(filters.command("done") & filters.private)
+async def cmd_done(_, message: Message):
+    if not _authorized(message.from_user.id):
+        return await message.reply("⛔ You are not authorized.")
+
+    uid = message.from_user.id
+    session = _download_session.get(uid)
+    if not session or not session["file_ids"]:
+        return await _safe_reply(
+            message,
+            "📭 No active download session.\nJust drop files here and I'll download them silently, then use /done to check progress.",
+        )
+
+    file_ids = session["file_ids"]
+    total_count = len(file_ids)
+    total_size_bytes = session["total_size"]
+
+    files = await crud.get_files_bulk(file_ids)
+
+    downloaded_count = sum(1 for f in files if f.status.value == "ready")
+    downloaded_size = sum(f.size_bytes or 0 for f in files if f.status.value == "ready")
+    error_count = sum(1 for f in files if f.status.value == "error")
+    in_progress = total_count - downloaded_count - error_count
+
+    def _fmt(b: int) -> str:
+        if b >= 1024 ** 3:
+            return f"{b / 1024 ** 3:.1f} GB"
+        if b >= 1024 ** 2:
+            return f"{b / 1024 ** 2:.1f} MB"
+        return f"{b / 1024:.1f} KB"
+
+    lines = [
+        "📊 **Download Session**\n",
+        f"📁 Files:  **{downloaded_count}/{total_count}** downloaded",
+        f"💾 Size:   **{_fmt(downloaded_size)} / {_fmt(total_size_bytes)}**",
+    ]
+    if in_progress > 0:
+        lines.append(f"⬇️ In progress: {in_progress} file(s)")
+    if error_count:
+        lines.append(f"❌ Failed: {error_count} file(s)")
+    if in_progress == 0 and error_count == 0:
+        lines.append(f"\n✅ All {total_count} file(s) downloaded!")
+        _download_session.pop(uid, None)
 
     await _safe_reply(message, "\n".join(lines))
 
