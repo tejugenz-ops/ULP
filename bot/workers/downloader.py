@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path
 
-from bot.config import TG_DOWNLOAD_WORKERS
+from bot.config import TG_DOWNLOAD_WORKERS, WORKER_ID
 from bot.db import crud
 from bot.db.models import FileStatus, JobStatus, JobType
 from bot.storage import bucket, local
@@ -32,8 +32,8 @@ def _is_archive(name: str) -> bool:
 
 
 async def _auto_extract(user_id: int, file_id: str, chat_id: int) -> None:
-    """Enqueue an extract_archive job for the file."""
-    from bot.workers._arq import enqueue
+    """Enqueue an extract_archive job back to this same worker's queue."""
+    from bot.workers._arq import enqueue, worker_queue
 
     job = await crud.create_job(
         user_id=user_id,
@@ -42,6 +42,7 @@ async def _auto_extract(user_id: int, file_id: str, chat_id: int) -> None:
     )
     await enqueue(
         "extract_archive",
+        _queue=worker_queue(WORKER_ID),
         user_id=user_id,
         file_id=file_id,
         password=None,
@@ -98,12 +99,14 @@ async def download_telegram_file(
 
         size = await local.get_file_size(dest)
 
-        # Mark READY immediately so scanning can start
+        # Mark READY immediately so scanning can start.
+        # Stamp worker_id so scan jobs are routed back to this worker's local disk.
         await crud.update_file(
             file_id,
             status=FileStatus.READY,
             local_path=str(dest),
             size_bytes=size,
+            worker_id=WORKER_ID,
         )
         await crud.update_job(job_id, status=JobStatus.COMPLETED, progress=100)
 
@@ -222,12 +225,14 @@ async def download_url(
         dest = dest_dir / original_name
         size = await local.get_file_size(dest)
 
-        # Mark READY immediately so scanning can start
+        # Mark READY immediately so scanning can start.
+        # Stamp worker_id so scan jobs are routed back to this worker's local disk.
         await crud.update_file(
             file_id,
             status=FileStatus.READY,
             local_path=str(dest),
             size_bytes=size,
+            worker_id=WORKER_ID,
         )
         await crud.update_job(job_id, status=JobStatus.COMPLETED, progress=100)
 
