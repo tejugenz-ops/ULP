@@ -6,3 +6,25 @@ healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+
+# ── Multi-worker scaling ──────────────────────────────────────────────
+#
+# This file defines the BOT service (WORKER_ID=0).
+# Each dedicated download worker is a SEPARATE Railway service using the
+# same Docker image but a different start command:
+#
+#   Start command: python -m bot.worker_main
+#
+# Required env vars per worker service (set in Railway dashboard):
+#   WORKER_ID=1          (unique per worker: 1, 2, 3, ... 10)
+#   WORKER_COUNT=10      (same value on ALL services including bot)
+#   TELEGRAM_BOT_TOKEN   (same as bot service)
+#   TELEGRAM_API_ID      (same as bot service)
+#   TELEGRAM_API_HASH    (same as bot service)
+#   DATABASE_URL         (shared PostgreSQL)
+#   REDIS_URL            (shared Redis)
+#   DATA_DIR=/data       (each worker gets its own mounted volume)
+#
+# Volume: attach a Railway volume at /data to EACH worker service.
+# Each worker writes session + downloaded files to its own volume.
+# Scans are always local (worker only scans files it downloaded).
